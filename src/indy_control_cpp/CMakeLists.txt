@@ -58,6 +58,57 @@ target_link_libraries(indydcp3
     gRPC::grpc++_reflection
 )
 
+#Check;  connection check node
+add_executable(indy_connection_check_node src/check/indy_connection_check_node.cpp)
+
+ament_target_dependencies(indy_connection_check_node
+  rclcpp
+  std_msgs
+)
+target_link_libraries(indy_connection_check_node
+  indydcp3
+)
+install(TARGETS
+  indy_connection_check_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+#Check; 유효잘량 체크
+add_executable(indy_pinocchio_meff_check src/check/indy_pinocchio_meff_check.cpp)
+target_link_libraries(indy_pinocchio_meff_check pinocchio::pinocchio)
+install(TARGETS
+  indy_pinocchio_meff_check
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+#Check; 유효질량 검증용 (매트랩 비교)
+add_executable(indy_pinocchio_meff_with_gearing
+  src/check/indy_pinocchio_meff_with_gearing.cpp
+)
+target_link_libraries(indy_pinocchio_meff_with_gearing
+  pinocchio::pinocchio
+)
+install(TARGETS
+  indy_pinocchio_meff_with_gearing
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+#Check ; indy speed check node
+add_executable(indy_speed_check_node
+  src/check/indy_speed_check_node.cpp
+)
+ament_target_dependencies(indy_speed_check_node
+  rclcpp
+)
+target_link_libraries(indy_speed_check_node
+  indydcp3
+  pinocchio::pinocchio
+)
+install(TARGETS
+  indy_speed_check_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 # indy_speeed _node
 add_executable(indy_speed_control_node src/indy_speed_control_node.cpp)
 
@@ -73,42 +124,9 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
-# connection check node
-add_executable(indy_connection_check_node src/indy_connection_check_node.cpp)
+# robot_dynamics
+find_package(hrc_interfaces REQUIRED)
 
-ament_target_dependencies(indy_connection_check_node
-  rclcpp
-  std_msgs
-)
-target_link_libraries(indy_connection_check_node
-  indydcp3
-)
-install(TARGETS
-  indy_connection_check_node
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-#피노키오
-add_executable(indy_pinocchio_meff_check src/indy_pinocchio_meff_check.cpp)
-target_link_libraries(indy_pinocchio_meff_check pinocchio::pinocchio)
-install(TARGETS
-  indy_pinocchio_meff_check
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-# 유효질량 검증용 (매트랩 비교)
-add_executable(indy_pinocchio_meff_with_gearing
-  src/indy_pinocchio_meff_with_gearing.cpp
-)
-target_link_libraries(indy_pinocchio_meff_with_gearing
-  pinocchio::pinocchio
-)
-install(TARGETS
-  indy_pinocchio_meff_with_gearing
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-# 실시간 데이터 기반 유효질량
 add_executable(robot_dynamics_node
   src/robot_dynamics_node.cpp)
 
@@ -122,23 +140,9 @@ install(TARGETS
 ament_target_dependencies(robot_dynamics_node
   rclcpp
   std_msgs
+  hrc_interfaces
 )
 
-#indy speed check node
-add_executable(indy_speed_check_node
-  src/indy_speed_check_node.cpp
-)
-ament_target_dependencies(indy_speed_check_node
-  rclcpp
-)
-target_link_libraries(indy_speed_check_node
-  indydcp3
-  pinocchio::pinocchio
-)
-install(TARGETS
-  indy_speed_check_node
-  DESTINATION lib/${PROJECT_NAME}
-)
 
 #collision_assessment
 find_package(geometry_msgs REQUIRED)
@@ -159,8 +163,26 @@ target_link_libraries(collision_assessment_node
   Eigen3::Eigen
 )
 
+# collision check 
+add_executable(collision_assessment_check
+  src/check/collision_assessment_check.cpp
+)
+ament_target_dependencies(collision_assessment_check
+  rclcpp
+  std_msgs
+  geometry_msgs
+  hrc_interfaces
+)
+target_link_libraries(collision_assessment_check
+  nlohmann_json::nlohmann_json
+  Eigen3::Eigen
+)
+
+
+
 install(TARGETS
   collision_assessment_node
+  collision_assessment_check
   DESTINATION lib/${PROJECT_NAME}
 )
 
