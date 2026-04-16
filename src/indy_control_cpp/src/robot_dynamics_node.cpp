@@ -20,6 +20,7 @@
 #include <array>
 
 #include "indy_control_cpp/indydcp3.h"
+#include <hrc_interfaces/msg/robot_dynamics_state.hpp>
 
 using namespace std::chrono_literals;
 
@@ -54,11 +55,23 @@ public:
   IndyRobotMeffNode()
   : Node("robot_dynamics_node")
   {
+
+    // ================================
+    // ROS2 
+    // ================================
+    
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(5)).best_effort();
+
+    pub_robot_state_ = this->create_publisher<hrc_interfaces::msg::RobotDynamicsState>(
+        "/indy/robot_dynamics_state", qos);
+
+
     // ================================
     // fixed settings
     // ================================
     robot_ip_  = "192.168.123.15";
     urdf_path_ = "/home/robotics/indy_ws/src/urdf_file/indy7.urdf";
+
 
     // ================================
     // Pinocchio model
@@ -115,6 +128,49 @@ public:
   }
 
 private:
+  rclcpp::Publisher<hrc_interfaces::msg::RobotDynamicsState>::SharedPtr pub_robot_state_;
+  Eigen::Vector3d robot_base_offset_world_{0.0, 0.0, 0.6};
+
+  void publishRobotDynamicsState(
+    const std::vector<Eigen::Vector3d> &link_com_positions,
+    const std::vector<Eigen::Vector3d> &link_com_velocities)
+  {
+    if (link_com_positions.size() != target_links_.size() ||
+        link_com_velocities.size() != target_links_.size()) {
+      RCLCPP_WARN(this->get_logger(),
+        "Robot dynamics state size mismatch: pos=%zu vel=%zu target_links=%zu",
+        link_com_positions.size(), link_com_velocities.size(), target_links_.size());
+      return;
+    }
+
+
+    hrc_interfaces::msg::RobotDynamicsState msg;
+    msg.header.stamp = this->now();
+    msg.header.frame_id = "world";
+
+    msg.link_indices.reserve(target_links_.size());
+    msg.link_names.reserve(target_links_.size());
+    msg.link_positions.reserve(target_links_.size() * 3);
+    msg.link_velocities.reserve(target_links_.size() * 3);
+
+    for (size_t i = 0; i < target_links_.size(); ++i) {
+      msg.link_indices.push_back(static_cast<uint32_t>(i));
+      msg.link_names.push_back(target_links_[i].name);
+
+      const auto &p = link_com_positions[i];
+      msg.link_positions.push_back(static_cast<float>(p.x()));
+      msg.link_positions.push_back(static_cast<float>(p.y()));
+      msg.link_positions.push_back(static_cast<float>(p.z()));
+
+      const auto &v = link_com_velocities[i];
+      msg.link_velocities.push_back(static_cast<float>(v.x()));
+      msg.link_velocities.push_back(static_cast<float>(v.y()));
+      msg.link_velocities.push_back(static_cast<float>(v.z()));
+    }
+
+    pub_robot_state_->publish(msg);
+  }
+
   static Eigen::Matrix3d skew(const Eigen::Vector3d &r)
   {
     Eigen::Matrix3d S;
@@ -279,13 +335,13 @@ private:
 
     Eigen::Vector3d v_com = Jv_com * qdot_rad;
 
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(6);
-    oss << "[J*qdot @ link6 BODY, LOCAL_WORLD_ALIGNED] "
-        << "v_frame[m/s]=[" << v_frame.transpose() << "] | "
-        << "w_frame[rad/s]=[" << w_frame.transpose() << "] | "
-        << "v_com[m/s]=[" << v_com.transpose() << "]";
-    RCLCPP_INFO(this->get_logger(), "%s", oss.str().c_str());
+    // std::ostringstream oss;
+    // oss << std::fixed << std::setprecision(6);
+    // oss << "[J*qdot @ link6 BODY, LOCAL_WORLD_ALIGNED] "
+    //     << "v_frame[m/s]=[" << v_frame.transpose() << "] | "
+    //     << "w_frame[rad/s]=[" << w_frame.transpose() << "] | "
+    //     << "v_com[m/s]=[" << v_com.transpose() << "]";
+    // RCLCPP_INFO(this->get_logger(), "%s", oss.str().c_str());
   }
 
   void timerCallback()
@@ -300,27 +356,77 @@ private:
       std::vector<double> meff_x;
       computeMeffWithGear(q_rad, meff_x);
 
+      std::vector<Eigen::Vector3d> link_com_positions;
+      std::vector<Eigen::Vector3d> link_com_velocities;
+      link_com_positions.reserve(target_links_.size());
+      link_com_velocities.reserve(target_links_.size());
+
+      pinocchio::computeJointJacobians(model_, *data_, q_rad);
+      pinocchio::updateFramePlacements(model_, *data_);
+
+      for (const auto &link : target_links_) {
+        const pinocchio::FrameIndex frame_id = link.frame_id;
+
+        const auto &frame = model_.frames[frame_id];
+        const pinocchio::JointIndex joint_id = frame.parentJoint;
+        const auto &inertia = model_.inertias[joint_id];
+
+        const Eigen::Vector3d com_local = inertia.lever();
+        const Eigen::Matrix3d R_wf = data_->oMf[frame_id].rotation();
+        const Eigen::Vector3d p_wf = data_->oMf[frame_id].translation();
+        const Eigen::Vector3d r_world = R_wf * com_local;
+
+        // Eigen::Vector3d p_com_world = p_wf + r_world;
+        Eigen::Vector3d p_com_world = p_wf + r_world + robot_base_offset_world_;
+
+        Eigen::MatrixXd J_frame(6, model_.nv);
+        J_frame.setZero();
+
+        pinocchio::getFrameJacobian(
+            model_, *data_, frame_id, pinocchio::LOCAL_WORLD_ALIGNED, J_frame);
+
+        Eigen::MatrixXd Jv_o = J_frame.topRows(3);
+        Eigen::MatrixXd Jw   = J_frame.bottomRows(3);
+        Eigen::MatrixXd Jv_com = Jv_o - skew(r_world) * Jw;
+
+        Eigen::Vector3d v_com = Jv_com * qdot_rad;
+
+        link_com_positions.push_back(p_com_world);
+        link_com_velocities.push_back(v_com);
+      }
+
+      publishRobotDynamicsState(link_com_positions, link_com_velocities);
+
       // 계산은 10ms마다, 출력은 10번에 1번
       static int print_count = 0;
       if ((print_count++ % 100) == 0) {
 
-        std::ostringstream q_oss;
-        q_oss << std::fixed << std::setprecision(3);
-        q_oss << "[q_deg] ";
-        for (int i = 0; i < q_deg.size(); ++i) {
-          q_oss << "q" << i << ": " << q_deg[i];
-          if (i + 1 < q_deg.size()) q_oss << " | ";
-        }
-        RCLCPP_INFO(this->get_logger(), "%s", q_oss.str().c_str());
+        // std::ostringstream q_oss;
+        // q_oss << std::fixed << std::setprecision(3);
+        // q_oss << "[q_deg] ";
+        // for (int i = 0; i < q_deg.size(); ++i) {
+        //   q_oss << "q" << i << ": " << q_deg[i];
+        //   if (i + 1 < q_deg.size()) q_oss << " | ";
+        // }
+        // RCLCPP_INFO(this->get_logger(), "%s", q_oss.str().c_str());
 
-        std::ostringstream qdot_oss;
-        qdot_oss << std::fixed << std::setprecision(3);
-        qdot_oss << "[qdot_deg/s assumed] ";
-        for (int i = 0; i < qdot_deg.size(); ++i) {
-          qdot_oss << "qdot" << i << ": " << qdot_deg[i];
-          if (i + 1 < qdot_deg.size()) qdot_oss << " | ";
+        // std::ostringstream qdot_oss;
+        // qdot_oss << std::fixed << std::setprecision(3);
+        // qdot_oss << "[qdot_deg/s assumed] ";
+        // for (int i = 0; i < qdot_deg.size(); ++i) {
+        //   qdot_oss << "qdot" << i << ": " << qdot_deg[i];
+        //   if (i + 1 < qdot_deg.size()) qdot_oss << " | ";
+        // }
+        // RCLCPP_INFO(this->get_logger(), "%s", qdot_oss.str().c_str());
+
+        if (link_com_positions.size() > 5) {
+          const auto &p6 = link_com_positions[5];
+          RCLCPP_INFO(
+            this->get_logger(),
+            "[link6 world CoM] x=%.3f, y=%.3f, z=%.3f",
+            p6.x(), p6.y(), p6.z()
+          );
         }
-        RCLCPP_INFO(this->get_logger(), "%s", qdot_oss.str().c_str());
       
         // 유효질량
         // std::ostringstream meff_oss;

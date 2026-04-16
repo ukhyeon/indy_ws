@@ -1,0 +1,92 @@
+{
+  "head": {
+    "F_max": 130.0,
+    "m_h_iso": 4.4,
+    "k": 150.0
+  },
+  "face": {
+    "F_max": 65.0,
+    "m_h_iso": 4.4,
+    "k": 75.0
+  },
+  "neck": {
+    "F_max": 300.0,
+    "m_h_iso": 1.2,
+    "k": 50.0
+  },
+  "left_shoulder": {
+    "F_max": 420.0,
+    "m_h_iso": 40.0,
+    "k": 35.0
+  },
+  "right_shoulder": {
+    "F_max": 420.0,
+    "m_h_iso": 40.0,
+    "k": 35.0
+  },
+  "chest": {
+    "F_max": 280.0,
+    "m_h_iso": 40.0,
+    "k": 25.0
+  },
+  "abdomen": {
+    "F_max": 220.0,
+    "m_h_iso": 40.0,
+    "k": 10.0
+  },
+  "pelvis": {
+    "F_max": 360.0,
+    "m_h_iso": 40.0,
+    "k": 25.0
+  },
+  "left_upper_arm": {
+    "F_max": 300.0,
+    "m_h_iso": 3.0,
+    "k": 30.0
+  },
+  "right_upper_arm": {
+    "F_max": 300.0,
+    "m_h_iso": 3.0,
+    "k": 30.0
+  },
+  "left_lower_arm": {
+    "F_max": 320.0,
+    "m_h_iso": 2.0,
+    "k": 40.0
+  },
+  "right_lower_arm": {
+    "F_max": 320.0,
+    "m_h_iso": 2.0,
+    "k": 40.0
+  },
+  "left_hand": {
+    "F_max": 280.0,
+    "m_h_iso": 0.6,
+    "k": 75.0
+  },
+  "right_hand": {
+    "F_max": 280.0,
+    "m_h_iso": 0.6,
+    "k": 75.0
+  },
+  "left_thigh": {
+    "F_max": 440.0,
+    "m_h_iso": 75.0,
+    "k": 50.0
+  },
+  "right_thigh": {
+    "F_max": 440.0,
+    "m_h_iso": 75.0,
+    "k": 50.0
+  },
+  "left_calf": {
+    "F_max": 260.0,
+    "m_h_iso": 75.0,
+    "k": 60.0
+  },
+  "right_calf": {
+    "F_max": 260.0,
+    "m_h_iso": 75.0,
+    "k": 60.0
+  }
+}

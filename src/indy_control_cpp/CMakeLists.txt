@@ -9,6 +9,8 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(nlohmann_json REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -30,7 +32,7 @@ endif()
 find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(pinocchio REQUIRED)
-find_package(rclcpp REQUIRED)
+
 
 file(GLOB INDY_PROTO_SRCS
   proto/*.pb.cc
@@ -137,5 +139,32 @@ install(TARGETS
   indy_speed_check_node
   DESTINATION lib/${PROJECT_NAME}
 )
+
+#collision_assessment
+find_package(geometry_msgs REQUIRED)
+find_package(hrc_interfaces REQUIRED)
+find_package(Eigen3 REQUIRED)
+
+add_executable(collision_assessment_node
+  src/collision_assessment_node.cpp
+)
+ament_target_dependencies(collision_assessment_node
+  rclcpp
+  std_msgs
+  geometry_msgs
+  hrc_interfaces
+)
+target_link_libraries(collision_assessment_node
+  nlohmann_json::nlohmann_json
+  Eigen3::Eigen
+)
+
+install(TARGETS
+  collision_assessment_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+
+ament_export_dependencies(rosidl_default_runtime)
 
 ament_package()
