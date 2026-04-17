@@ -7,6 +7,7 @@
 #include <hrc_interfaces/msg/directional_meff_query.hpp>
 #include <hrc_interfaces/msg/directional_meff_result.hpp>
 #include <hrc_interfaces/msg/collision_state.hpp>
+#include "hrc_interfaces/msg/collision_candidates.hpp"
 
 #include <Eigen/Dense>
 #include <nlohmann/json.hpp>
@@ -35,8 +36,8 @@ public:
     // =========================
     // Parameters
     // =========================
-    timer_period_ms_ = this->declare_parameter<int>("timer_period_ms", 33);
-    query_timeout_ms_ = this->declare_parameter<int>("query_timeout_ms", 100);
+    timer_period_ms_ = this->declare_parameter<int>("timer_period_ms", 10);
+    query_timeout_ms_ = this->declare_parameter<int>("query_timeout_ms", 150);
 
     iso_json_path_ = this->declare_parameter<std::string>(
       "iso_json_path",
@@ -52,7 +53,9 @@ public:
       throw std::runtime_error("Failed to load ISO JSON: " + iso_json_path_);
     }
 
+    //생성자
     initHumanBodyIndexMap();
+    initRobotLinkIndexMap();
 
     auto qos = rclcpp::QoS(rclcpp::KeepLast(5)).best_effort();
 
@@ -79,16 +82,22 @@ public:
     // Publishers
     // =========================
     pub_human_query_ = this->create_publisher<hrc_interfaces::msg::DirectionalMeffQuery>(
-      "/hrc/directional_meff_query", 10);
+      "/hrc/directional_meff_query", qos);
 
     pub_robot_query_ = this->create_publisher<hrc_interfaces::msg::DirectionalMeffQuery>(
-      "/indy/directional_meff_query", 10);
+      "/indy/directional_meff_query", qos);
 
     pub_speed_scale_ = this->create_publisher<std_msgs::msg::Float32>(
       "/indy/speed_scale", 10);
 
     pub_collision_state_ = this->create_publisher<hrc_interfaces::msg::CollisionState>(
       "/collision_state", 10);
+
+    pub_collision_candidates_ =
+    this->create_publisher<hrc_interfaces::msg::CollisionCandidates>(
+      "/hrc/collision_candidates",
+      rclcpp::QoS(rclcpp::KeepLast(5)).best_effort()
+    );
 
     timer_ = this->create_wall_timer(
       std::chrono::milliseconds(timer_period_ms_),
@@ -128,6 +137,17 @@ private:
 
     double human_meff{0.0};
     double robot_meff{0.0};
+
+    rclcpp::Time human_result_time; // 응답 측정용
+    rclcpp::Time robot_result_time; // 응답 측정용
+  };
+
+  struct CollisionCandidate
+  {
+    uint32_t human_index;
+    uint32_t robot_index;
+    double distance;
+    Eigen::Vector3d u_robot_to_human;
   };
 
 private:
@@ -292,6 +312,7 @@ private:
     return std::isfinite(best_dist);
   }
 
+  // 충돌 예상 부위와 방향을 토픽으로 날리고 유효질량을 받음
   void publishDirectionalQueries(
     uint64_t query_id,
     uint32_t human_index,
@@ -305,7 +326,7 @@ private:
     human_q.header.frame_id = "world";
     human_q.query_id = query_id;
     human_q.target_index = human_index;
-    human_q.direction_u = toRosVec(u_robot_to_human);
+    human_q.direction_u = toRosVec(u_robot_to_human); // human 은 그대로 u
     pub_human_query_->publish(human_q);
 
     hrc_interfaces::msg::DirectionalMeffQuery robot_q;
@@ -313,8 +334,17 @@ private:
     robot_q.header.frame_id = "world";
     robot_q.query_id = query_id;
     robot_q.target_index = robot_index;
-    robot_q.direction_u = toRosVec(u_robot_to_human);
+    robot_q.direction_u = toRosVec(-u_robot_to_human); // robot 은 -u
     pub_robot_query_->publish(robot_q);
+
+    // 충돌 방향 logger
+    RCLCPP_INFO_THROTTLE(
+    this->get_logger(), *this->get_clock(), 500,
+    "[query] qid=%lu | h=%u r=%u | u_h=[%.3f %.3f %.3f] | u_r=[%.3f %.3f %.3f]",
+    query_id,
+    human_index, robot_index,
+    u_robot_to_human.x(), u_robot_to_human.y(), u_robot_to_human.z(),
+    -u_robot_to_human.x(), -u_robot_to_human.y(), -u_robot_to_human.z());
   }
 
   double computeRelativeSpeedAlongU(
@@ -371,9 +401,10 @@ private:
     return clamp(ratio, min_speed_scale_, max_speed_scale_);
   }
 
+  // 1차 저역 통과 필터, 현재 값과 목표 값 차이를 보고 
   double updateSpeedScaleSmooth(double target_speed_scale)
   {
-    const double alpha = (target_speed_scale < current_speed_scale_) ? alpha_down_ : alpha_up_;
+    const double alpha = (target_speed_scale < current_speed_scale_) ? alpha_down_ : alpha_up_; // 감속은 빠르게, 가속은 천천히
     current_speed_scale_ =
       current_speed_scale_ + alpha * (target_speed_scale - current_speed_scale_);
 
@@ -416,6 +447,102 @@ private:
   }
 
 private:
+
+  void initRobotLinkIndexMap()
+  {
+    robot_index_to_link_name_.clear();
+    robot_index_to_link_name_[0] = "link1";
+    robot_index_to_link_name_[1] = "link2";
+    robot_index_to_link_name_[2] = "link3";
+    robot_index_to_link_name_[3] = "link4";
+    robot_index_to_link_name_[4] = "link5";
+    robot_index_to_link_name_[5] = "link6";
+  }
+
+  bool computeTopKCollisionCandidates(
+    std::vector<CollisionCandidate> &top_candidates,
+    size_t k = 3)
+  {
+    top_candidates.clear();
+
+    const size_t human_n = human_state_.positions.size();
+    const size_t robot_n = robot_state_.positions.size();
+
+    if (!human_state_.valid || !robot_state_.valid || human_n == 0 || robot_n == 0) {
+      return false;
+    }
+
+    std::vector<CollisionCandidate> all_candidates;
+    all_candidates.reserve(human_n);
+
+    for (size_t hi = 0; hi < human_n; ++hi) {
+      double best_dist = std::numeric_limits<double>::infinity();
+      uint32_t best_robot = 0;
+      Eigen::Vector3d best_u = Eigen::Vector3d::UnitX();
+
+      const Eigen::Vector3d &ph = human_state_.positions[hi];
+
+      for (size_t ri = 0; ri < robot_n; ++ri) {
+        const Eigen::Vector3d &pr = robot_state_.positions[ri];
+        Eigen::Vector3d d = ph - pr;
+        const double dist = d.norm();
+
+        if (dist < best_dist) {
+          best_dist = dist;
+          best_robot = static_cast<uint32_t>(ri);
+
+          if (dist > 1e-9) {
+            best_u = d / dist;   // robot -> human
+          } else {
+            best_u = Eigen::Vector3d::UnitX();
+          }
+        }
+      }
+
+      CollisionCandidate c;
+      c.human_index = static_cast<uint32_t>(hi);
+      c.robot_index = best_robot;
+      c.distance = best_dist;
+      c.u_robot_to_human = best_u;
+      all_candidates.push_back(c);
+    }
+
+    std::sort(all_candidates.begin(), all_candidates.end(),
+              [](const CollisionCandidate &a, const CollisionCandidate &b) {
+                return a.distance < b.distance;
+              });
+
+    const size_t out_n = std::min(k, all_candidates.size());
+    top_candidates.assign(all_candidates.begin(), all_candidates.begin() + out_n);
+    return !top_candidates.empty();
+  }
+
+  void publishCollisionCandidates(const std::vector<CollisionCandidate> &cands)
+  {
+    hrc_interfaces::msg::CollisionCandidates msg;
+    msg.header.stamp = this->now();
+    msg.header.frame_id = "world";
+
+    for (const auto &c : cands) {
+      msg.human_indices.push_back(c.human_index);
+      msg.human_names.push_back(human_index_to_part_name_[c.human_index]);
+
+      msg.robot_indices.push_back(c.robot_index);
+
+      auto it = robot_index_to_link_name_.find(c.robot_index);
+      if (it != robot_index_to_link_name_.end()) {
+        msg.robot_names.push_back(it->second);
+      } else {
+        msg.robot_names.push_back("unknown");
+      }
+
+      msg.distances.push_back(static_cast<float>(c.distance));
+      msg.directions.push_back(toRosVec(c.u_robot_to_human));
+    }
+
+    pub_collision_candidates_->publish(msg);
+  }
+
   void humanStateCallback(const hrc_interfaces::msg::HumanDynamicsState::SharedPtr msg)
   {
     std::vector<Eigen::Vector3d> pos, vel;
@@ -490,6 +617,7 @@ private:
 
     pq.human_meff = msg->directional_meff;
     pq.human_result_ready = true;
+    pq.human_result_time = this->now();
   }
 
   void robotResultCallback(const hrc_interfaces::msg::DirectionalMeffResult::SharedPtr msg)
@@ -510,6 +638,7 @@ private:
 
     pq.robot_meff = msg->directional_meff;
     pq.robot_result_ready = true;
+    pq.robot_result_time = this->now();
   }
 
   void timerCallback()
@@ -518,71 +647,139 @@ private:
       return;
     }
 
-    // pending query 처리
     if (pending_query_.has_value()) {
       auto &pq = pending_query_.value();
 
       if (pq.human_result_ready && pq.robot_result_ready) {
         const double rel_speed = computeRelativeSpeedAlongU(
           pq.human_index, pq.robot_index, pq.u);
+        
 
         auto iso_opt = getIsoLimitForHumanIndex(pq.human_index);
         if (!iso_opt.has_value()) {
-          RCLCPP_WARN(this->get_logger(),
-            "No ISO mapping for human_index=%u, using conservative slowdown",
-            pq.human_index);
 
+          const std::string part_name = human_index_to_part_name_[pq.human_index];
+          // 없다면 에러 나도록 디버그,
+          RCLCPP_ERROR(
+            this->get_logger(),
+            "Missing ISO limit for human part: index=%u name=%s | qid=%lu",
+            pq.human_index,
+            part_name.c_str(),
+            pq.query_id
+          );
+          
           const double next_scale = updateSpeedScaleSmooth(min_speed_scale_);
           publishSpeedScale(next_scale);
           publishCollisionState(pq, rel_speed, next_scale);
           pending_query_.reset();
-          return;
+        } else {
+          const double target_scale = computeTargetSpeedScale(
+            rel_speed,
+            pq.human_meff,
+            pq.robot_meff,
+            iso_opt.value()
+          );
+
+          const double next_scale = updateSpeedScaleSmooth(target_scale);
+          publishSpeedScale(next_scale);
+          publishCollisionState(pq, rel_speed, next_scale);
+
+          // 응답 주기 디버그
+          const double t_human_ms =
+            (pq.human_result_time - pq.sent_time).nanoseconds() / 1e6;
+          const double t_robot_ms =
+            (pq.robot_result_time - pq.sent_time).nanoseconds() / 1e6;
+          const double t_total_ms =
+            (this->now() - pq.sent_time).nanoseconds() / 1e6;
+          // 응답 주기 디버그
+          // RCLCPP_INFO(
+          //   this->get_logger(),
+          //   "[rt] qid=%lu | human=%.1f ms | robot=%.1f ms | total=%.1f ms",
+          //   pq.query_id, t_human_ms, t_robot_ms, t_total_ms);
+          
+          const std::string part_name = human_index_to_part_name_[pq.human_index];
+          RCLCPP_INFO(
+            this->get_logger(),
+            "[collision] qid=%lu | part=%s | h=%u r=%u | dist=%.3f | vrel=%.3f | "
+            "meff_h=%.2f meff_r=%.2f | target=%.2f current=%.2f",
+            pq.query_id,
+            part_name.c_str(),
+            pq.human_index, pq.robot_index,
+            pq.distance,
+            rel_speed,
+            pq.human_meff,
+            pq.robot_meff,
+            target_scale,
+            next_scale
+          );
+
+          pending_query_.reset();
         }
-
-        const double target_scale = computeTargetSpeedScale(
-          rel_speed, pq.human_meff, pq.robot_meff, iso_opt.value());
-
-        const double next_scale = updateSpeedScaleSmooth(target_scale);
-
-        publishSpeedScale(next_scale);
-        publishCollisionState(pq, rel_speed, next_scale);
-
-        const std::string part_name = human_index_to_part_name_[pq.human_index];
-        const double mu = computeReducedMass(pq.human_meff, pq.robot_meff);
-        const double v_allow = computeVmax(iso_opt->F_max, mu, iso_opt->k);
-
-        RCLCPP_INFO_THROTTLE(
-          this->get_logger(), *this->get_clock(), 500,
-          "[collision] qid=%lu | part=%s | h=%u r=%u | dist=%.3f | vrel=%.3f | meff_h=%.2f meff_r=%.2f | v_allow=%.3f | target=%.2f current=%.2f",
-          pq.query_id, part_name.c_str(), pq.human_index, pq.robot_index,
-          pq.distance, rel_speed, pq.human_meff, pq.robot_meff,
-          v_allow, target_scale, next_scale);
-
-        pending_query_.reset();
+        // 여기서 return 하지 않음
       }
       else if (pendingExpired(pq)) {
-        RCLCPP_WARN(this->get_logger(),
+        RCLCPP_WARN(
+          this->get_logger(),
           "Query timeout: qid=%lu (human=%d, robot=%d)",
-          pq.query_id, pq.human_result_ready, pq.robot_result_ready);
+          pq.query_id,
+          pq.human_result_ready ? 1 : 0,
+          pq.robot_result_ready ? 1 : 0
+        );
 
         const double next_scale = updateSpeedScaleSmooth(min_speed_scale_);
         publishSpeedScale(next_scale);
         pending_query_.reset();
-      }
 
-      return;
+        // 여기서도 return 하지 않음
+      }
+      else {
+        // 아직 결과 기다리는 중이면 이때만 종료
+        return;
+      }
     }
 
-    // 새 query 생성
+    // pending이 없으므로 같은 tick에서 즉시 새 query 생성
     uint32_t human_index = 0;
     uint32_t robot_index = 0;
     double distance = 0.0;
     Eigen::Vector3d u = Eigen::Vector3d::UnitX();
 
+
+
+    // pair 를 찾지 못하면 return
     if (!findClosestPair(human_index, robot_index, distance, u)) {
       return;
     }
 
+    // 로봇의 리치보다 거리가 먼지 확인
+    const double robot_radius_m = 1.3;
+    const double distance_margin = 1.15;
+    const double assessment_distance_threshold = robot_radius_m * distance_margin;  // 1.495 m
+
+    // 로봇과 거리가 너무 멀다면 return
+    if (distance > assessment_distance_threshold) {
+      const double target_scale = 1.0;
+      const double next_scale = updateSpeedScaleSmooth(target_scale);
+      publishSpeedScale(next_scale);
+
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "[far skip] dist=%.3f m > threshold=%.3f m | speed keep %.2f",
+        distance, assessment_distance_threshold, next_scale
+      );
+      return;
+    }
+
+    // ===== threshold 안에 들어왔을 때만 top 3 publish =====
+    {
+      std::vector<CollisionCandidate> top_candidates;
+      if (computeTopKCollisionCandidates(top_candidates, 3)) {
+        publishCollisionCandidates(top_candidates);
+      }
+    }
+    // ===============================================
+
+    // 여기서 directional query 발행
     PendingQuery pq;
     pq.query_id = ++query_counter_;
     pq.sent_time = this->now();
@@ -591,10 +788,16 @@ private:
     pq.distance = distance;
     pq.u = u;
 
-    publishDirectionalQueries(pq.query_id, pq.human_index, pq.robot_index, pq.u);
+    publishDirectionalQueries(
+      pq.query_id,
+      pq.human_index,
+      pq.robot_index,
+      pq.u
+    );
+
     pending_query_ = pq;
   }
-
+ 
 private:
   // Subscribers
   rclcpp::Subscription<hrc_interfaces::msg::HumanDynamicsState>::SharedPtr sub_human_state_;
@@ -607,6 +810,8 @@ private:
   rclcpp::Publisher<hrc_interfaces::msg::DirectionalMeffQuery>::SharedPtr pub_robot_query_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pub_speed_scale_;
   rclcpp::Publisher<hrc_interfaces::msg::CollisionState>::SharedPtr pub_collision_state_;
+  rclcpp::Publisher<hrc_interfaces::msg::CollisionCandidates>::SharedPtr pub_collision_candidates_;
+  std::unordered_map<uint32_t, std::string> robot_index_to_link_name_;
 
   rclcpp::TimerBase::SharedPtr timer_;
 
@@ -617,8 +822,8 @@ private:
   uint64_t query_counter_{0};
   double current_speed_scale_{1.0};
 
-  int timer_period_ms_{33};
-  int query_timeout_ms_{100};
+  int timer_period_ms_{10};
+  int query_timeout_ms_{150};
 
   double alpha_up_{0.10};
   double alpha_down_{0.35};

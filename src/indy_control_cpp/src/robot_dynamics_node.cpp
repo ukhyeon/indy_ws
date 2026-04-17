@@ -21,6 +21,8 @@
 
 #include "indy_control_cpp/indydcp3.h"
 #include <hrc_interfaces/msg/robot_dynamics_state.hpp>
+#include "hrc_interfaces/msg/directional_meff_query.hpp"
+#include "hrc_interfaces/msg/directional_meff_result.hpp"
 
 using namespace std::chrono_literals;
 
@@ -64,6 +66,16 @@ public:
 
     pub_robot_state_ = this->create_publisher<hrc_interfaces::msg::RobotDynamicsState>(
         "/indy/robot_dynamics_state", qos);
+
+    sub_robot_query_ =
+      this->create_subscription<hrc_interfaces::msg::DirectionalMeffQuery>(
+        "/indy/directional_meff_query",
+        qos,
+        std::bind(&IndyRobotMeffNode::robotQueryCallback, this, std::placeholders::_1));
+
+    pub_robot_result_ =
+      this->create_publisher<hrc_interfaces::msg::DirectionalMeffResult>(
+        "/indy/directional_meff_result", qos);
 
 
     // ================================
@@ -129,7 +141,17 @@ public:
 
 private:
   rclcpp::Publisher<hrc_interfaces::msg::RobotDynamicsState>::SharedPtr pub_robot_state_;
+  rclcpp::Subscription<hrc_interfaces::msg::DirectionalMeffQuery>::SharedPtr sub_robot_query_;
+  rclcpp::Publisher<hrc_interfaces::msg::DirectionalMeffResult>::SharedPtr pub_robot_result_;
+
+  // latest snapshot cache
+  Eigen::VectorXd latest_q_rad_;
+  Eigen::VectorXd latest_qdot_rad_;
+  rclcpp::Time latest_state_stamp_{0, 0, RCL_ROS_TIME};
+  bool has_latest_state_{false};
+  
   Eigen::Vector3d robot_base_offset_world_{0.0, 0.0, 0.6};
+
 
   void publishRobotDynamicsState(
     const std::vector<Eigen::Vector3d> &link_com_positions,
@@ -353,6 +375,12 @@ private:
       Eigen::VectorXd q_rad    = degToRad(q_deg);
       Eigen::VectorXd qdot_rad = degToRad(qdot_deg);
 
+      latest_q_rad_ = q_rad;
+      latest_qdot_rad_ = qdot_rad;
+      latest_state_stamp_ = this->now();
+      has_latest_state_ = true;
+
+
       std::vector<double> meff_x;
       computeMeffWithGear(q_rad, meff_x);
 
@@ -451,6 +479,121 @@ private:
         this->get_logger(), *this->get_clock(), 2000,
         "timerCallback unknown error"
       );
+    }
+  }
+
+  double computeDirectionalMeffForTarget(
+    int target_index,
+    const Eigen::Vector3d &u_world,
+    const Eigen::VectorXd &q_rad)
+  {
+    // 최신 q 기준으로 모델 업데이트
+    pinocchio::computeJointJacobians(model_, *data_, q_rad);
+    pinocchio::updateFramePlacements(model_, *data_);
+
+    const auto &link = target_links_.at(static_cast<size_t>(target_index));
+    const pinocchio::FrameIndex frame_id = link.frame_id;
+
+    const auto &frame = model_.frames[frame_id];
+    const pinocchio::JointIndex joint_id = frame.parentJoint;
+    const auto &inertia = model_.inertias[joint_id];
+
+    const Eigen::Vector3d com_local = inertia.lever();
+    const Eigen::Matrix3d R_wf = data_->oMf[frame_id].rotation();
+    const Eigen::Vector3d r_world = R_wf * com_local;
+
+    Eigen::MatrixXd J_frame(6, model_.nv);
+    J_frame.setZero();
+
+    pinocchio::getFrameJacobian(
+      model_, *data_, frame_id, pinocchio::LOCAL_WORLD_ALIGNED, J_frame);
+
+    // Pinocchio convention: [linear; angular]
+    Eigen::MatrixXd Jv_o = J_frame.topRows(3);
+    Eigen::MatrixXd Jw   = J_frame.bottomRows(3);
+
+    // frame origin -> CoM point
+    Eigen::MatrixXd Jv_com = Jv_o - skew(r_world) * Jw;
+
+    // 여기부터는 네 기존 로봇 meff 계산 로직에 맞춰 연결
+    // 핵심은 directional scalar meff = 1 / (u^T Λ^{-1} u)
+    //  gear 반영
+
+    pinocchio::crba(model_, *data_, q_rad);
+    data_->M.triangularView<Eigen::StrictlyLower>() =
+        data_->M.transpose().triangularView<Eigen::StrictlyLower>();
+
+    Eigen::MatrixXd M_aug = data_->M;
+    M_aug.diagonal() += lambda_diag_;
+
+    Eigen::LDLT<Eigen::MatrixXd> ldlt_aug(M_aug);
+
+    Eigen::MatrixXd X_aug = ldlt_aug.solve(Jv_com.transpose());
+    Eigen::Matrix3d A_aug = Jv_com * X_aug;
+
+    double meff = effectiveMassAlong(A_aug, u_world);
+    return meff;
+  }
+
+  void robotQueryCallback(
+    const hrc_interfaces::msg::DirectionalMeffQuery::SharedPtr msg)
+  {
+    hrc_interfaces::msg::DirectionalMeffResult result;
+    result.header.stamp = this->now();
+    result.header.frame_id = "world";
+    result.query_id = msg->query_id;
+    result.target_index = msg->target_index;
+    result.valid = false;
+    result.directional_meff = 0.0f;
+
+    if (!has_latest_state_) {
+      RCLCPP_WARN(this->get_logger(),
+        "Robot directional query received before state cache is ready");
+      pub_robot_result_->publish(result);
+      return;
+    }
+
+    const int target_index = static_cast<int>(msg->target_index);
+
+    if (target_index < 0 || target_index >= static_cast<int>(target_links_.size())) {
+      RCLCPP_WARN(this->get_logger(),
+        "Invalid robot target_index: %d (target_links_.size=%zu)",
+        target_index, target_links_.size());
+      pub_robot_result_->publish(result);
+      return;
+    }
+
+    Eigen::Vector3d u(
+      msg->direction_u.x,
+      msg->direction_u.y,
+      msg->direction_u.z
+    );
+
+    const double norm = u.norm();
+    if (norm < 1e-8) {
+      RCLCPP_WARN(this->get_logger(),
+        "Robot directional query has near-zero direction vector");
+      pub_robot_result_->publish(result);
+      return;
+    }
+    u /= norm;
+
+    try {
+      const double meff = computeDirectionalMeffForTarget(target_index, u, latest_q_rad_);
+
+      result.valid = true;
+      result.directional_meff = static_cast<float>(meff);
+      pub_robot_result_->publish(result);
+
+      RCLCPP_INFO(this->get_logger(),
+        "[robot meff result] qid=%lu target=%d u=(%.3f, %.3f, %.3f) meff=%.3f",
+        msg->query_id, target_index, u.x(), u.y(), u.z(), meff);
+
+    } catch (const std::exception &e) {
+      RCLCPP_ERROR(this->get_logger(),
+        "Failed robot directional meff: qid=%lu target=%d err=%s",
+        msg->query_id, target_index, e.what());
+      pub_robot_result_->publish(result);
     }
   }
 
