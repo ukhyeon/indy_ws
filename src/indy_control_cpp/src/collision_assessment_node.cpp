@@ -8,6 +8,7 @@
 #include <hrc_interfaces/msg/directional_meff_result.hpp>
 #include <hrc_interfaces/msg/collision_state.hpp>
 #include "hrc_interfaces/msg/collision_candidates.hpp"
+#include <hrc_interfaces/msg/demo_state.hpp>
 
 #include <Eigen/Dense>
 #include <nlohmann/json.hpp>
@@ -99,15 +100,53 @@ public:
       rclcpp::QoS(rclcpp::KeepLast(5)).best_effort()
     );
 
+    pub_demo_state_ = this->create_publisher<hrc_interfaces::msg::DemoState>(
+      "/hrc/demo_state", 10);
+
     timer_ = this->create_wall_timer(
       std::chrono::milliseconds(timer_period_ms_),
       std::bind(&CollisionAssessmentNode::timerCallback, this));
+
+    demo_log_path_ = "/home/robotics/hrc_ws/analysis/demo_log/demo_metrics.csv";
+    demo_log_ofs_.open(demo_log_path_, std::ios::out | std::ios::trunc);
+    
+    demo_start_time_ = this->now();
+    demo_time_initialized_ = true;
 
     RCLCPP_INFO(this->get_logger(), "collision_assessment_node started");
     RCLCPP_INFO(this->get_logger(), "Loaded ISO JSON: %s", iso_json_path_.c_str());
   }
 
 private:
+  struct DemoStateSnapshot
+  {
+    rclcpp::Time stamp;
+    double t_demo_sec{0.0};
+
+    uint32_t selected_human_index{0};
+    uint32_t selected_robot_index{0};
+
+    std::string selected_body_name;
+    std::string selected_link_name;
+
+    double distance{0.0};
+    Eigen::Vector3d direction_u{1.0, 0.0, 0.0};
+
+    double relative_speed_along_u{0.0};
+    double human_meff{0.0};
+    double robot_meff{0.0};
+    double reduced_mass{0.0};
+
+    double target_speed_scale{1.0};
+    double applied_speed_scale{1.0};
+
+    double estimated_collision_force{0.0};
+    double threshold_force{0.0};
+
+    std::vector<double> link_speed_magnitudes;
+  };
+
+
   struct IsoLimit
   {
     double F_max{0.0};    // N
@@ -331,7 +370,9 @@ private:
     const Eigen::Vector3d v_r = robot_state_.velocities[robot_index];
 
     // positive -> robot approaching human along u
-    return (v_r - v_h).dot(u_robot_to_human);
+    // return (v_r - v_h).dot(u_robot_to_human);
+
+    return v_r.dot(u_robot_to_human); // 임시 디버그, 사람의 속도 0
   }
 
   std::optional<IsoLimit> getIsoLimitForHumanIndex(uint32_t human_index) const
@@ -371,6 +412,19 @@ private:
     return clamp(ratio, min_speed_scale_, max_speed_scale_);
   }
 
+  double computeEstimatedCollisionForce(
+    double relative_speed_along_u,
+    double reduced_mass,
+    double k_kN_per_m) const
+  {
+    if (relative_speed_along_u <= 0.0) {
+      return 0.0;
+    }
+
+    const double k = k_kN_per_m * 1e3; // N/m
+    return relative_speed_along_u * std::sqrt(std::max(reduced_mass * k, 1e-9));
+  }
+
   // 1차 저역 통과 필터, 현재 값과 목표 값 차이를 보고 
   double updateSpeedScaleSmooth(double target_speed_scale)
   {
@@ -380,6 +434,17 @@ private:
 
     current_speed_scale_ = clamp(current_speed_scale_, min_speed_scale_, max_speed_scale_);
     return current_speed_scale_;
+  }
+
+  std::vector<double> computeRobotLinkSpeedMagnitudes() const
+  {
+    std::vector<double> out;
+    out.reserve(robot_state_.velocities.size());
+
+    for (const auto &v : robot_state_.velocities) {
+      out.push_back(v.norm());
+    }
+    return out;
   }
 
   void publishCollisionState(
@@ -403,11 +468,88 @@ private:
     pub_collision_state_->publish(msg);
   }
 
+  void publishDemoState(const DemoStateSnapshot &snap)
+  {
+    hrc_interfaces::msg::DemoState msg;
+    msg.header.stamp = snap.stamp;
+    msg.header.frame_id = "world";
+
+    msg.t_demo_sec = static_cast<float>(snap.t_demo_sec);
+
+    msg.selected_human_index = snap.selected_human_index;
+    msg.selected_robot_index = snap.selected_robot_index;
+
+    msg.selected_body_name = snap.selected_body_name;
+    msg.selected_link_name = snap.selected_link_name;
+
+    msg.distance = static_cast<float>(snap.distance);
+    msg.direction_u = toRosVec(snap.direction_u);
+
+    msg.relative_speed_along_u = static_cast<float>(snap.relative_speed_along_u);
+    msg.human_meff = static_cast<float>(snap.human_meff);
+    msg.robot_meff = static_cast<float>(snap.robot_meff);
+    msg.reduced_mass = static_cast<float>(snap.reduced_mass);
+
+    msg.target_speed_scale = static_cast<float>(snap.target_speed_scale);
+    msg.applied_speed_scale = static_cast<float>(snap.applied_speed_scale);
+
+    msg.estimated_collision_force = static_cast<float>(snap.estimated_collision_force);
+    msg.threshold_force = static_cast<float>(snap.threshold_force);
+
+    for (double v : snap.link_speed_magnitudes) {
+      msg.link_speed_magnitudes.push_back(static_cast<float>(v));
+    }
+
+    pub_demo_state_->publish(msg);
+  }
+
   void publishSpeedScale(double scale)
   {
     std_msgs::msg::Float32 msg;
     msg.data = static_cast<float>(clamp(scale, min_speed_scale_, max_speed_scale_));
     pub_speed_scale_->publish(msg);
+  }
+
+  void writeDemoLogHeaderIfNeeded()
+  {
+    if (demo_log_header_written_ || !demo_log_ofs_.is_open()) return;
+
+    demo_log_ofs_
+      << "t_demo_sec,"
+      << "selected_link,selected_body,"
+      << "speed_scale_target,speed_scale_applied,"
+      << "distance,relative_speed_along_u,"
+      << "human_meff,robot_meff,reduced_mass,"
+      << "estimated_collision_force,threshold_force,"
+      << "link1_speed,link2_speed,link3_speed,link4_speed,link5_speed,link6_speed\n";
+
+    demo_log_header_written_ = true;
+  }
+
+  void appendDemoLog(const DemoStateSnapshot &snap)
+  {
+    if (!demo_log_ofs_.is_open()) return;
+    writeDemoLogHeaderIfNeeded();
+
+    demo_log_ofs_
+      << snap.t_demo_sec << ","
+      << snap.selected_link_name << ","
+      << snap.selected_body_name << ","
+      << snap.target_speed_scale << ","
+      << snap.applied_speed_scale << ","
+      << snap.distance << ","
+      << snap.relative_speed_along_u << ","
+      << snap.human_meff << ","
+      << snap.robot_meff << ","
+      << snap.reduced_mass << ","
+      << snap.estimated_collision_force << ","
+      << snap.threshold_force;
+
+    for (size_t i = 0; i < 6; ++i) {
+      double v = (i < snap.link_speed_magnitudes.size()) ? snap.link_speed_magnitudes[i] : 0.0;
+      demo_log_ofs_ << "," << v;
+    }
+    demo_log_ofs_ << "\n";
   }
   
   // batch 안에서 candidate 찾기
@@ -627,6 +769,7 @@ private:
     }
 
     pub_collision_candidates_->publish(msg);
+
   }
 
   void humanStateCallback(const hrc_interfaces::msg::HumanDynamicsState::SharedPtr msg)
@@ -788,6 +931,50 @@ private:
 
           const double next_scale = updateSpeedScaleSmooth(best_target_scale);
           publishSpeedScale(next_scale);
+          auto iso_opt = getIsoLimitForHumanIndex(best_cand->human_index);
+          if (!iso_opt.has_value()) {
+            RCLCPP_ERROR(this->get_logger(), "ISO limit missing while building demo snapshot");
+            const double fail_scale = updateSpeedScaleSmooth(min_speed_scale_);
+            publishSpeedScale(fail_scale);
+            pending_query_.reset();
+            return;
+          }
+          DemoStateSnapshot snap;
+          snap.stamp = this->now();
+          snap.t_demo_sec = (snap.stamp - demo_start_time_).seconds();
+
+          snap.selected_human_index = best_cand->human_index;
+          snap.selected_robot_index = best_cand->robot_index;
+
+          snap.selected_body_name = human_index_to_part_name_[best_cand->human_index];
+          snap.selected_link_name = robot_index_to_link_name_[best_cand->robot_index];
+
+          snap.distance = best_cand->distance;
+          snap.direction_u = best_cand->u;
+
+          snap.relative_speed_along_u = rel_speeds[best_idx];
+          snap.human_meff = best_cand->human_meff;
+          snap.robot_meff = best_cand->robot_meff;
+          snap.reduced_mass = computeReducedMass(snap.human_meff, snap.robot_meff);
+
+          snap.target_speed_scale = best_target_scale;
+          snap.applied_speed_scale = next_scale;
+
+          snap.threshold_force = iso_opt->F_max;
+          snap.estimated_collision_force = computeEstimatedCollisionForce(
+            snap.relative_speed_along_u,
+            snap.reduced_mass,
+            iso_opt->k
+          );
+
+          snap.link_speed_magnitudes = computeRobotLinkSpeedMagnitudes();
+
+          latest_demo_state_ = snap;
+          has_latest_demo_state_ = true;
+
+          publishDemoState(snap);
+          appendDemoLog(snap);
+
           publishCollisionState(*best_cand, rel_speeds[best_idx], next_scale);
 
           const std::string part_name = human_index_to_part_name_[best_cand->human_index];
@@ -908,7 +1095,9 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pub_speed_scale_;
   rclcpp::Publisher<hrc_interfaces::msg::CollisionState>::SharedPtr pub_collision_state_;
   rclcpp::Publisher<hrc_interfaces::msg::CollisionCandidates>::SharedPtr pub_collision_candidates_;
+  rclcpp::Publisher<hrc_interfaces::msg::DemoState>::SharedPtr pub_demo_state_;
   std::unordered_map<uint32_t, std::string> robot_index_to_link_name_;
+
 
   rclcpp::TimerBase::SharedPtr timer_;
 
@@ -919,6 +1108,14 @@ private:
 
   uint64_t query_counter_{0};
   double current_speed_scale_{1.0};
+
+  // 데모 영상 시간 맞춤
+  DemoStateSnapshot latest_demo_state_;
+  bool has_latest_demo_state_{false};
+
+  rclcpp::Time demo_start_time_{0, 0, RCL_ROS_TIME};
+  bool demo_time_initialized_{false};
+
 
   int timer_period_ms_{10};
   int query_timeout_ms_{150};
@@ -931,6 +1128,10 @@ private:
   std::string iso_json_path_;
   std::unordered_map<std::string, IsoLimit> iso_limits_;
   std::unordered_map<uint32_t, std::string> human_index_to_part_name_;
+  std::ofstream demo_log_ofs_;
+  std::string demo_log_path_;
+  bool demo_log_header_written_{false};
+
 };
 
 int main(int argc, char **argv)
