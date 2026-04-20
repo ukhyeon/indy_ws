@@ -123,13 +123,14 @@ private:
     bool valid{false};
   };
 
-  struct PendingQuery
+  struct PendingCandidateQuery
   {
     uint64_t query_id{0};
-    rclcpp::Time sent_time;
+
     uint32_t human_index{0};
     uint32_t robot_index{0};
-    Eigen::Vector3d u{1.0, 0.0, 0.0}; // robot -> human
+
+    Eigen::Vector3d u{1.0, 0.0, 0.0};   // robot -> human
     double distance{0.0};
 
     bool human_result_ready{false};
@@ -138,8 +139,16 @@ private:
     double human_meff{0.0};
     double robot_meff{0.0};
 
-    rclcpp::Time human_result_time; // 응답 측정용
-    rclcpp::Time robot_result_time; // 응답 측정용
+    rclcpp::Time sent_time;
+    rclcpp::Time human_result_time;
+    rclcpp::Time robot_result_time;
+  };
+
+  struct PendingBatchQuery
+  {
+    uint64_t batch_id{0};
+    rclcpp::Time batch_sent_time;
+    std::vector<PendingCandidateQuery> candidates;   // size <= 3
   };
 
   struct CollisionCandidate
@@ -272,45 +281,6 @@ private:
     human_index_to_part_name_[18] = "right_hand";
   }
 
-  bool findClosestPair(
-    uint32_t &human_index,
-    uint32_t &robot_index,
-    double &distance_out,
-    Eigen::Vector3d &u_out)
-  {
-    if (!human_state_.valid || !robot_state_.valid) {
-      return false;
-    }
-
-    if (human_state_.positions.empty() || robot_state_.positions.empty()) {
-      return false;
-    }
-
-    double best_dist = std::numeric_limits<double>::infinity();
-    uint32_t best_h = 0;
-    uint32_t best_r = 0;
-    Eigen::Vector3d best_u = Eigen::Vector3d::UnitX();
-
-    for (uint32_t r = 0; r < robot_state_.positions.size(); ++r) {
-      for (uint32_t h = 0; h < human_state_.positions.size(); ++h) {
-        const Eigen::Vector3d diff = human_state_.positions[h] - robot_state_.positions[r];
-        const double dist = diff.norm();
-
-        if (dist < best_dist) {
-          best_dist = dist;
-          best_h = h;
-          best_r = r;
-          best_u = diff / normSafe(diff);
-        }
-      }
-    }
-
-    human_index = best_h;
-    robot_index = best_r;
-    distance_out = best_dist;
-    u_out = best_u;
-    return std::isfinite(best_dist);
-  }
 
   // 충돌 예상 부위와 방향을 토픽으로 날리고 유효질량을 받음
   void publishDirectionalQueries(
@@ -413,7 +383,7 @@ private:
   }
 
   void publishCollisionState(
-    const PendingQuery &pq,
+    const PendingCandidateQuery &cand,
     double rel_speed,
     double speed_scale)
   {
@@ -421,13 +391,13 @@ private:
     msg.header.stamp = this->now();
     msg.header.frame_id = "world";
 
-    msg.human_index = pq.human_index;
-    msg.robot_index = pq.robot_index;
-    msg.distance = static_cast<float>(pq.distance);
-    msg.direction_u = toRosVec(pq.u);
+    msg.human_index = cand.human_index;
+    msg.robot_index = cand.robot_index;
+    msg.distance = static_cast<float>(cand.distance);
+    msg.direction_u = toRosVec(cand.u);
     msg.relative_speed_along_u = static_cast<float>(rel_speed);
-    msg.human_meff = static_cast<float>(pq.human_meff);
-    msg.robot_meff = static_cast<float>(pq.robot_meff);
+    msg.human_meff = static_cast<float>(cand.human_meff);
+    msg.robot_meff = static_cast<float>(cand.robot_meff);
     msg.speed_scale = static_cast<float>(speed_scale);
 
     pub_collision_state_->publish(msg);
@@ -439,12 +409,88 @@ private:
     msg.data = static_cast<float>(clamp(scale, min_speed_scale_, max_speed_scale_));
     pub_speed_scale_->publish(msg);
   }
-
-  bool pendingExpired(const PendingQuery &pq) const
+  
+  // batch 안에서 candidate 찾기
+  PendingCandidateQuery* findPendingCandidate(uint64_t query_id)
   {
-    const auto dt_ms = (this->now() - pq.sent_time).nanoseconds() / 1e6;
+    if (!pending_query_.has_value()) {
+      return nullptr;
+    }
+
+    auto &batch = pending_query_.value();
+    for (auto &cand : batch.candidates) {
+      if (cand.query_id == query_id) {
+        return &cand;
+      }
+    }
+    return nullptr;
+  }
+
+  //batch 완료 여부 확인
+  bool batchAllResultsReady(const PendingBatchQuery &batch) const
+  {
+    if (batch.candidates.empty()) {
+      return false;
+    }
+
+    for (const auto &cand : batch.candidates) {
+      if (!(cand.human_result_ready && cand.robot_result_ready)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  // batch timeout 확인
+  bool pendingExpired(const PendingBatchQuery &batch) const
+  {
+    const auto dt_ms = (this->now() - batch.batch_sent_time).nanoseconds() / 1e6;
     return dt_ms > static_cast<double>(query_timeout_ms_);
   }
+
+  // 가장 보수적인 candidate 선택 helper
+  const PendingCandidateQuery* selectMostConservativeCandidate(
+  const PendingBatchQuery &batch,
+  std::vector<double> &target_scales,
+  std::vector<double> &rel_speeds)
+  {
+    target_scales.clear();
+    rel_speeds.clear();
+
+    if (batch.candidates.empty()) {
+      return nullptr;
+    }
+
+    const PendingCandidateQuery *best = nullptr;
+    double best_target_scale = std::numeric_limits<double>::infinity();
+
+    for (const auto &cand : batch.candidates) {
+      const double rel_speed = computeRelativeSpeedAlongU(
+        cand.human_index, cand.robot_index, cand.u);
+
+      auto iso_opt = getIsoLimitForHumanIndex(cand.human_index);
+      if (!iso_opt.has_value()) {
+        return nullptr;  // caller에서 에러 처리
+      }
+
+      const double target_scale = computeTargetSpeedScale(
+        rel_speed,
+        cand.human_meff,
+        cand.robot_meff,
+        iso_opt.value()
+      );
+
+      rel_speeds.push_back(rel_speed);
+      target_scales.push_back(target_scale);
+
+      if (target_scale < best_target_scale) {
+        best_target_scale = target_scale;
+        best = &cand;
+      }
+    }
+
+    return best;
+  }
+
 
 private:
 
@@ -457,6 +503,19 @@ private:
     robot_index_to_link_name_[3] = "link4";
     robot_index_to_link_name_[4] = "link5";
     robot_index_to_link_name_[5] = "link6";
+  }
+
+  // 충돌 제외 부위
+  bool isValidRobotCollisionIndex(uint32_t robot_index) const
+  {
+    // link0, link1 제외
+    return !(robot_index == 0 || robot_index == 1);
+  }
+
+  bool isValidHumanCollisionIndex(uint32_t human_index) const
+  {
+    // left_foot(6), right_foot(7) 제외
+    return !(human_index == 6 || human_index == 7);
   }
 
   bool computeTopKCollisionCandidates(
@@ -476,20 +535,36 @@ private:
     all_candidates.reserve(human_n);
 
     for (size_t hi = 0; hi < human_n; ++hi) {
+      const uint32_t human_index = static_cast<uint32_t>(hi);
+
+      // ===== human 후보 필터 =====
+      if (!isValidHumanCollisionIndex(human_index)) {
+        continue;
+      }
+
       double best_dist = std::numeric_limits<double>::infinity();
       uint32_t best_robot = 0;
       Eigen::Vector3d best_u = Eigen::Vector3d::UnitX();
+      bool found_valid_robot = false;
 
       const Eigen::Vector3d &ph = human_state_.positions[hi];
 
       for (size_t ri = 0; ri < robot_n; ++ri) {
+        const uint32_t robot_index = static_cast<uint32_t>(ri);
+
+        // ===== robot 후보 필터 =====
+        if (!isValidRobotCollisionIndex(robot_index)) {
+          continue;
+        }
+
         const Eigen::Vector3d &pr = robot_state_.positions[ri];
         Eigen::Vector3d d = ph - pr;
         const double dist = d.norm();
 
         if (dist < best_dist) {
           best_dist = dist;
-          best_robot = static_cast<uint32_t>(ri);
+          best_robot = robot_index;
+          found_valid_robot = true;
 
           if (dist > 1e-9) {
             best_u = d / dist;   // robot -> human
@@ -499,18 +574,29 @@ private:
         }
       }
 
+      // 유효한 robot 후보가 하나도 없으면 skip
+      if (!found_valid_robot) {
+        continue;
+      }
+
       CollisionCandidate c;
-      c.human_index = static_cast<uint32_t>(hi);
+      c.human_index = human_index;
       c.robot_index = best_robot;
       c.distance = best_dist;
       c.u_robot_to_human = best_u;
       all_candidates.push_back(c);
     }
 
-    std::sort(all_candidates.begin(), all_candidates.end(),
-              [](const CollisionCandidate &a, const CollisionCandidate &b) {
-                return a.distance < b.distance;
-              });
+    if (all_candidates.empty()) {
+      return false;
+    }
+
+    std::sort(
+      all_candidates.begin(),
+      all_candidates.end(),
+      [](const CollisionCandidate &a, const CollisionCandidate &b) {
+        return a.distance < b.distance;
+      });
 
     const size_t out_n = std::min(k, all_candidates.size());
     top_candidates.assign(all_candidates.begin(), all_candidates.begin() + out_n);
@@ -605,19 +691,23 @@ private:
       return;
     }
 
-    auto &pq = pending_query_.value();
-    if (msg->query_id != pq.query_id) {
+    auto *cand = findPendingCandidate(msg->query_id);
+    if (cand == nullptr) {
       return;
     }
 
     if (!msg->valid) {
-      RCLCPP_WARN(this->get_logger(), "Human meff result invalid for query_id=%lu", msg->query_id);
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Human meff result invalid for query_id=%lu",
+        msg->query_id
+      );
       return;
     }
 
-    pq.human_meff = msg->directional_meff;
-    pq.human_result_ready = true;
-    pq.human_result_time = this->now();
+    cand->human_meff = msg->directional_meff;
+    cand->human_result_ready = true;
+    cand->human_result_time = this->now();
   }
 
   void robotResultCallback(const hrc_interfaces::msg::DirectionalMeffResult::SharedPtr msg)
@@ -626,19 +716,23 @@ private:
       return;
     }
 
-    auto &pq = pending_query_.value();
-    if (msg->query_id != pq.query_id) {
+    auto *cand = findPendingCandidate(msg->query_id);
+    if (cand == nullptr) {
       return;
     }
 
     if (!msg->valid) {
-      RCLCPP_WARN(this->get_logger(), "Robot meff result invalid for query_id=%lu", msg->query_id);
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Robot meff result invalid for query_id=%lu",
+        msg->query_id
+      );
       return;
     }
 
-    pq.robot_meff = msg->directional_meff;
-    pq.robot_result_ready = true;
-    pq.robot_result_time = this->now();
+    cand->robot_meff = msg->directional_meff;
+    cand->robot_result_ready = true;
+    cand->robot_result_time = this->now();
   }
 
   void timerCallback()
@@ -647,116 +741,114 @@ private:
       return;
     }
 
+    // =====================================================
+    // 1) pending batch 처리
+    // =====================================================
     if (pending_query_.has_value()) {
-      auto &pq = pending_query_.value();
+      auto &batch = pending_query_.value();
 
-      if (pq.human_result_ready && pq.robot_result_ready) {
-        const double rel_speed = computeRelativeSpeedAlongU(
-          pq.human_index, pq.robot_index, pq.u);
-        
+      if (batchAllResultsReady(batch)) {
+        std::vector<double> target_scales;
+        std::vector<double> rel_speeds;
+        const auto *best_cand = selectMostConservativeCandidate(
+          batch, target_scales, rel_speeds);
 
-        auto iso_opt = getIsoLimitForHumanIndex(pq.human_index);
-        if (!iso_opt.has_value()) {
+        if (best_cand == nullptr) {
+          // ISO 누락 등 비정상 상황 -> 에러 + fail-safe
+          for (const auto &cand : batch.candidates) {
+            auto iso_opt = getIsoLimitForHumanIndex(cand.human_index);
+            if (!iso_opt.has_value()) {
+              const std::string part_name = human_index_to_part_name_[cand.human_index];
+              RCLCPP_ERROR(
+                this->get_logger(),
+                "Missing ISO limit for human part: index=%u name=%s | qid=%lu",
+                cand.human_index,
+                part_name.c_str(),
+                cand.query_id
+              );
+            }
+          }
 
-          const std::string part_name = human_index_to_part_name_[pq.human_index];
-          // 없다면 에러 나도록 디버그,
-          RCLCPP_ERROR(
-            this->get_logger(),
-            "Missing ISO limit for human part: index=%u name=%s | qid=%lu",
-            pq.human_index,
-            part_name.c_str(),
-            pq.query_id
-          );
-          
           const double next_scale = updateSpeedScaleSmooth(min_speed_scale_);
           publishSpeedScale(next_scale);
-          publishCollisionState(pq, rel_speed, next_scale);
           pending_query_.reset();
-        } else {
-          const double target_scale = computeTargetSpeedScale(
-            rel_speed,
-            pq.human_meff,
-            pq.robot_meff,
-            iso_opt.value()
-          );
+        }
+        else {
+          // best candidate의 target scale 찾기
+          size_t best_idx = 0;
+          double best_target_scale = std::numeric_limits<double>::infinity();
 
-          const double next_scale = updateSpeedScaleSmooth(target_scale);
+          for (size_t i = 0; i < batch.candidates.size(); ++i) {
+            if (batch.candidates[i].query_id == best_cand->query_id) {
+              best_idx = i;
+              best_target_scale = target_scales[i];
+              break;
+            }
+          }
+
+          const double next_scale = updateSpeedScaleSmooth(best_target_scale);
           publishSpeedScale(next_scale);
-          publishCollisionState(pq, rel_speed, next_scale);
+          publishCollisionState(*best_cand, rel_speeds[best_idx], next_scale);
 
-          // 응답 주기 디버그
-          const double t_human_ms =
-            (pq.human_result_time - pq.sent_time).nanoseconds() / 1e6;
-          const double t_robot_ms =
-            (pq.robot_result_time - pq.sent_time).nanoseconds() / 1e6;
-          const double t_total_ms =
-            (this->now() - pq.sent_time).nanoseconds() / 1e6;
-          // 응답 주기 디버그
-          // RCLCPP_INFO(
-          //   this->get_logger(),
-          //   "[rt] qid=%lu | human=%.1f ms | robot=%.1f ms | total=%.1f ms",
-          //   pq.query_id, t_human_ms, t_robot_ms, t_total_ms);
-          
-          const std::string part_name = human_index_to_part_name_[pq.human_index];
+          const std::string part_name = human_index_to_part_name_[best_cand->human_index];
           RCLCPP_INFO(
             this->get_logger(),
-            "[collision] qid=%lu | part=%s | h=%u r=%u | dist=%.3f | vrel=%.3f | "
-            "meff_h=%.2f meff_r=%.2f | target=%.2f current=%.2f",
-            pq.query_id,
+            "[collision-top3] batch=%lu | selected=%s | h=%u r=%u | dist=%.3f | "
+            "vrel=%.3f | meff_h=%.2f meff_r=%.2f | target=%.2f current=%.2f",
+            batch.batch_id,
             part_name.c_str(),
-            pq.human_index, pq.robot_index,
-            pq.distance,
-            rel_speed,
-            pq.human_meff,
-            pq.robot_meff,
-            target_scale,
+            best_cand->human_index, best_cand->robot_index,
+            best_cand->distance,
+            rel_speeds[best_idx],
+            best_cand->human_meff,
+            best_cand->robot_meff,
+            best_target_scale,
             next_scale
           );
 
           pending_query_.reset();
         }
-        // 여기서 return 하지 않음
       }
-      else if (pendingExpired(pq)) {
+      else if (pendingExpired(batch)) {
+        int ready_h = 0;
+        int ready_r = 0;
+        for (const auto &cand : batch.candidates) {
+          ready_h += cand.human_result_ready ? 1 : 0;
+          ready_r += cand.robot_result_ready ? 1 : 0;
+        }
+
         RCLCPP_WARN(
           this->get_logger(),
-          "Query timeout: qid=%lu (human=%d, robot=%d)",
-          pq.query_id,
-          pq.human_result_ready ? 1 : 0,
-          pq.robot_result_ready ? 1 : 0
+          "Batch query timeout: batch=%lu (human_ready=%d/%zu, robot_ready=%d/%zu)",
+          batch.batch_id,
+          ready_h, batch.candidates.size(),
+          ready_r, batch.candidates.size()
         );
 
         const double next_scale = updateSpeedScaleSmooth(min_speed_scale_);
         publishSpeedScale(next_scale);
         pending_query_.reset();
-
-        // 여기서도 return 하지 않음
       }
       else {
-        // 아직 결과 기다리는 중이면 이때만 종료
-        return;
+        return;  // 아직 batch 응답 대기 중
       }
     }
 
-    // pending이 없으므로 같은 tick에서 즉시 새 query 생성
-    uint32_t human_index = 0;
-    uint32_t robot_index = 0;
-    double distance = 0.0;
-    Eigen::Vector3d u = Eigen::Vector3d::UnitX();
-
-
-
-    // pair 를 찾지 못하면 return
-    if (!findClosestPair(human_index, robot_index, distance, u)) {
+    // =====================================================
+    // 2) top3 후보 생성
+    // =====================================================
+    std::vector<CollisionCandidate> top_candidates;
+    if (!computeTopKCollisionCandidates(top_candidates, 3)) {
       return;
     }
 
-    // 로봇의 리치보다 거리가 먼지 확인
+    // nearest candidate 기준으로 threshold 판단
+    const double distance = top_candidates.front().distance;
+
     const double robot_radius_m = 1.3;
     const double distance_margin = 1.15;
     const double assessment_distance_threshold = robot_radius_m * distance_margin;  // 1.495 m
 
-    // 로봇과 거리가 너무 멀다면 return
     if (distance > assessment_distance_threshold) {
       const double target_scale = 1.0;
       const double next_scale = updateSpeedScaleSmooth(target_scale);
@@ -764,38 +856,43 @@ private:
 
       RCLCPP_INFO_THROTTLE(
         this->get_logger(), *this->get_clock(), 1000,
-        "[far skip] dist=%.3f m > threshold=%.3f m | speed keep %.2f",
+        "[far skip] nearest_dist=%.3f m > threshold=%.3f m | speed keep %.2f",
         distance, assessment_distance_threshold, next_scale
       );
       return;
     }
 
-    // ===== threshold 안에 들어왔을 때만 top 3 publish =====
-    {
-      std::vector<CollisionCandidate> top_candidates;
-      if (computeTopKCollisionCandidates(top_candidates, 3)) {
-        publishCollisionCandidates(top_candidates);
-      }
+    // threshold 안에 들어왔을 때만 top3 publish
+    publishCollisionCandidates(top_candidates);
+
+    // =====================================================
+    // 3) top3 전체에 대해 query batch 발행
+    // =====================================================
+    PendingBatchQuery batch;
+    batch.batch_id = ++batch_counter_;
+    batch.batch_sent_time = this->now();
+    batch.candidates.reserve(top_candidates.size());
+
+    for (const auto &c : top_candidates) {
+      PendingCandidateQuery cand;
+      cand.query_id = ++query_counter_;
+      cand.sent_time = this->now();
+      cand.human_index = c.human_index;
+      cand.robot_index = c.robot_index;
+      cand.distance = c.distance;
+      cand.u = c.u_robot_to_human;
+
+      publishDirectionalQueries(
+        cand.query_id,
+        cand.human_index,
+        cand.robot_index,
+        cand.u
+      );
+
+      batch.candidates.push_back(cand);
     }
-    // ===============================================
 
-    // 여기서 directional query 발행
-    PendingQuery pq;
-    pq.query_id = ++query_counter_;
-    pq.sent_time = this->now();
-    pq.human_index = human_index;
-    pq.robot_index = robot_index;
-    pq.distance = distance;
-    pq.u = u;
-
-    publishDirectionalQueries(
-      pq.query_id,
-      pq.human_index,
-      pq.robot_index,
-      pq.u
-    );
-
-    pending_query_ = pq;
+    pending_query_ = std::move(batch);
   }
  
 private:
@@ -817,7 +914,8 @@ private:
 
   DynamicsSnapshot human_state_;
   DynamicsSnapshot robot_state_;
-  std::optional<PendingQuery> pending_query_;
+  std::optional<PendingBatchQuery> pending_query_; // cadidate 뱔로 query_id를 쓰고
+  uint64_t batch_counter_{0}; // 배치 단위
 
   uint64_t query_counter_{0};
   double current_speed_scale_{1.0};
