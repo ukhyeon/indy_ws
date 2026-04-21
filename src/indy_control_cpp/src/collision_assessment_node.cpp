@@ -133,15 +133,29 @@ private:
     Eigen::Vector3d direction_u{1.0, 0.0, 0.0};
 
     double relative_speed_along_u{0.0};
-    double human_meff{0.0};
+    double robot_speed_along_u_raw{0.0};
+    double approach_bias_added{0.0};
+
+    double human_meff{0.0};       // directional meff
+    double human_meff_iso{0.0};   // iso fixed m_h_iso
     double robot_meff{0.0};
-    double reduced_mass{0.0};
+
+    double reduced_mass{0.0};     // directional
+    double reduced_mass_iso{0.0}; // iso fixed
+
+    double iso_k{0.0};
+    double v_allow_dir{0.0};
+    double v_allow_iso{0.0};
 
     double target_speed_scale{1.0};
     double applied_speed_scale{1.0};
 
-    double estimated_collision_force{0.0};
+    double estimated_collision_force_dir{0.0};
+    double estimated_collision_force_iso{0.0};
+
     double threshold_force{0.0};
+    double force_ratio_dir{0.0};
+    double force_ratio_iso{0.0};
 
     std::vector<double> link_speed_magnitudes;
   };
@@ -544,7 +558,7 @@ private:
     msg.target_speed_scale = static_cast<float>(snap.target_speed_scale);
     msg.applied_speed_scale = static_cast<float>(snap.applied_speed_scale);
 
-    msg.estimated_collision_force = static_cast<float>(snap.estimated_collision_force);
+    msg.estimated_collision_force = static_cast<float>(snap.estimated_collision_force_dir);
     msg.threshold_force = static_cast<float>(snap.threshold_force);
 
     for (double v : snap.link_speed_magnitudes) {
@@ -567,11 +581,21 @@ private:
 
     demo_log_ofs_
       << "t_demo_sec,"
+      << "selected_human_index,selected_robot_index,"
       << "selected_link,selected_body,"
+      << "u_x,u_y,u_z,"
+      << "distance,"
+      << "robot_speed_along_u_raw,"
+      << "approach_bias_added,"
+      << "relative_speed_along_u,"
+      << "human_meff_dir,human_meff_iso,robot_meff,"
+      << "reduced_mass_dir,reduced_mass_iso,"
+      << "iso_k,"
+      << "v_allow_dir,v_allow_iso,"
       << "speed_scale_target,speed_scale_applied,"
-      << "distance,relative_speed_along_u,"
-      << "human_meff,robot_meff,reduced_mass,"
-      << "estimated_collision_force,threshold_force,"
+      << "estimated_collision_force_dir,estimated_collision_force_iso,"
+      << "threshold_force,"
+      << "force_ratio_dir,force_ratio_iso,"
       << "link1_speed,link2_speed,link3_speed,link4_speed,link5_speed,link6_speed\n";
 
     demo_log_header_written_ = true;
@@ -584,17 +608,32 @@ private:
 
     demo_log_ofs_
       << snap.t_demo_sec << ","
+      << snap.selected_human_index << ","
+      << snap.selected_robot_index << ","
       << snap.selected_link_name << ","
       << snap.selected_body_name << ","
-      << snap.target_speed_scale << ","
-      << snap.applied_speed_scale << ","
+      << snap.direction_u.x() << ","
+      << snap.direction_u.y() << ","
+      << snap.direction_u.z() << ","
       << snap.distance << ","
+      << snap.robot_speed_along_u_raw << ","
+      << snap.approach_bias_added << ","
       << snap.relative_speed_along_u << ","
       << snap.human_meff << ","
+      << snap.human_meff_iso << ","
       << snap.robot_meff << ","
       << snap.reduced_mass << ","
-      << snap.estimated_collision_force << ","
-      << snap.threshold_force;
+      << snap.reduced_mass_iso << ","
+      << snap.iso_k << ","
+      << snap.v_allow_dir << ","
+      << snap.v_allow_iso << ","
+      << snap.target_speed_scale << ","
+      << snap.applied_speed_scale << ","
+      << snap.estimated_collision_force_dir << ","
+      << snap.estimated_collision_force_iso << ","
+      << snap.threshold_force << ","
+      << snap.force_ratio_dir << ","
+      << snap.force_ratio_iso;
 
     for (size_t i = 0; i < 6; ++i) {
       double v = (i < snap.link_speed_magnitudes.size()) ? snap.link_speed_magnitudes[i] : 0.0;
@@ -1050,22 +1089,67 @@ private:
           snap.selected_body_name = human_index_to_part_name_[best_cand->human_index];
           snap.selected_link_name = robot_index_to_link_name_[best_cand->robot_index];
           snap.distance = best_cand->distance;
+          //
+
           snap.direction_u = best_cand->u;
           snap.relative_speed_along_u = rel_speeds[best_idx];
-          snap.human_meff = best_cand->human_meff;
+
+          const Eigen::Vector3d u_norm = best_cand->u.normalized();
+          const Eigen::Vector3d v_r = robot_state_.velocities[best_cand->robot_index];
+          const double vr_along_u = v_r.dot(u_norm);
+
+          snap.robot_speed_along_u_raw = vr_along_u;
+          snap.approach_bias_added = std::max(0.0, snap.relative_speed_along_u - vr_along_u);
+
+          snap.human_meff = best_cand->human_meff;               // directional meff
+          snap.human_meff_iso = iso_opt->m_h_iso;                // fixed ISO mass
           snap.robot_meff = best_cand->robot_meff;
+
           snap.reduced_mass = computeReducedMass(snap.human_meff, snap.robot_meff);
+          snap.reduced_mass_iso = computeReducedMass(snap.human_meff_iso, snap.robot_meff);
+
+          snap.iso_k = iso_opt->k;
+          snap.v_allow_dir = computeVmax(
+            iso_opt->F_max,
+            snap.reduced_mass,
+            iso_opt->k
+          );
+          snap.v_allow_iso = computeVmax(
+            iso_opt->F_max,
+            snap.reduced_mass_iso,
+            iso_opt->k
+          );
+
           snap.target_speed_scale = best_target_scale;
           snap.threshold_force = iso_opt->F_max;
-          snap.estimated_collision_force = computeEstimatedCollisionForce(
+
+          snap.estimated_collision_force_dir = computeEstimatedCollisionForce(
             snap.relative_speed_along_u,
             snap.reduced_mass,
             iso_opt->k
           );
 
+          snap.estimated_collision_force_iso = computeEstimatedCollisionForce(
+            snap.relative_speed_along_u,
+            snap.reduced_mass_iso,
+            iso_opt->k
+          );
+
+          snap.force_ratio_dir =
+            snap.threshold_force > 1e-6
+              ? snap.estimated_collision_force_dir / snap.threshold_force
+              : 0.0;
+
+          snap.force_ratio_iso =
+            snap.threshold_force > 1e-6
+              ? snap.estimated_collision_force_iso / snap.threshold_force
+              : 0.0;
+          //
+
+
           const double guarded_target_scale = applyForceLimitGuard(
             best_target_scale,
-            snap.estimated_collision_force,
+            snap.estimated_collision_force_dir,
             snap.threshold_force
           );
 
