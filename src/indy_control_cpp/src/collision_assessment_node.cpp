@@ -391,10 +391,15 @@ private:
     const Eigen::Vector3d u = u_robot_to_human.normalized();
     const Eigen::Vector3d v_r = robot_state_.velocities[robot_index];
 
-    // 사람은 항상 로봇 방향으로 0.3 m/s로 접근한다고 가정
-    const Eigen::Vector3d v_h = -0.3 * u;
+    const double vr_along_u = v_r.dot(u);
 
-    return (v_r - v_h).dot(u);
+    // 로봇이 멀어지는 중이면 위험 접근속도 0
+    if (vr_along_u <= 0.0) {
+      return 0.0;
+    }
+
+    // 로봇이 접근할 때만 사람 접근속도 0.3 m/s를 보수적으로 더함
+    return vr_along_u + 0.3;
   }
 
   std::optional<IsoLimit> getIsoLimitForHumanIndex(uint32_t human_index) const
@@ -445,6 +450,29 @@ private:
 
     const double k = k_kN_per_m * 1e3; // N/m
     return relative_speed_along_u * std::sqrt(std::max(reduced_mass * k, 1e-9));
+  }
+
+  double applyForceLimitGuard(
+    double target_speed_scale,
+    double estimated_collision_force,
+    double threshold_force) const
+  {
+    const double eps = 1e-6;
+    const double ratio = estimated_collision_force / std::max(threshold_force, eps);
+
+    double guarded_scale = target_speed_scale;
+
+    if (ratio > 1.30) {
+      guarded_scale = std::min(guarded_scale, 0.05);
+    } else if (ratio > 1.15) {
+      guarded_scale = std::min(guarded_scale, 0.10);
+    } else if (ratio > 1.05) {
+      guarded_scale = std::min(guarded_scale, 0.20);
+    } else if (ratio > 1.00) {
+      guarded_scale = std::min(guarded_scale, 0.35);
+    }
+
+    return clamp(guarded_scale, min_speed_scale_, max_speed_scale_);
   }
 
   // 허용 속도
@@ -768,6 +796,61 @@ private:
     return !top_candidates.empty();
   }
 
+  void publishRiskOrderedCollisionCandidates(
+    const PendingBatchQuery &batch,
+    const std::vector<double> &target_scales)
+  {
+    if (batch.candidates.empty() || batch.candidates.size() != target_scales.size()) {
+      return;
+    }
+
+    struct RankedItem
+    {
+      size_t idx;
+      double target_scale;
+    };
+
+    std::vector<RankedItem> ranked;
+    ranked.reserve(batch.candidates.size());
+
+    for (size_t i = 0; i < batch.candidates.size(); ++i) {
+      ranked.push_back({i, target_scales[i]});
+    }
+
+    // target_scale가 작을수록 더 위험
+    std::sort(
+      ranked.begin(),
+      ranked.end(),
+      [](const RankedItem &a, const RankedItem &b) {
+        return a.target_scale < b.target_scale;
+      });
+
+    hrc_interfaces::msg::CollisionCandidates msg;
+    msg.header.stamp = this->now();
+    msg.header.frame_id = "world";
+
+    for (const auto &r : ranked) {
+      const auto &cand = batch.candidates[r.idx];
+
+      msg.human_indices.push_back(cand.human_index);
+      msg.human_names.push_back(human_index_to_part_name_[cand.human_index]);
+
+      msg.robot_indices.push_back(cand.robot_index);
+
+      auto it = robot_index_to_link_name_.find(cand.robot_index);
+      if (it != robot_index_to_link_name_.end()) {
+        msg.robot_names.push_back(it->second);
+      } else {
+        msg.robot_names.push_back("unknown");
+      }
+
+      msg.distances.push_back(static_cast<float>(cand.distance));
+      msg.directions.push_back(toRosVec(cand.u));
+    }
+
+    pub_collision_candidates_->publish(msg);
+  }
+
   void publishCollisionCandidates(const std::vector<CollisionCandidate> &cands)
   {
     hrc_interfaces::msg::CollisionCandidates msg;
@@ -918,9 +1001,10 @@ private:
       return;
     }
 
-    // =====================================================
+    bool should_publish_speed = false;
+    double speed_to_publish = current_speed_scale_;
+
     // 1) pending batch 처리
-    // =====================================================
     if (pending_query_.has_value()) {
       auto &batch = pending_query_.value();
 
@@ -931,27 +1015,12 @@ private:
           batch, target_scales, rel_speeds);
 
         if (best_cand == nullptr) {
-          // ISO 누락 등 비정상 상황 -> 에러 + fail-safe 최대 감속
-          for (const auto &cand : batch.candidates) {
-            auto iso_opt = getIsoLimitForHumanIndex(cand.human_index);
-            if (!iso_opt.has_value()) {
-              const std::string part_name = human_index_to_part_name_[cand.human_index];
-              RCLCPP_ERROR(
-                this->get_logger(),
-                "Missing ISO limit for human part: index=%u name=%s | qid=%lu",
-                cand.human_index,
-                part_name.c_str(),
-                cand.query_id
-              );
-            }
-          }
-
-          const double next_scale = updateSpeedScaleSmooth(min_speed_scale_);
-          publishSpeedScale(next_scale);
+          speed_to_publish = updateSpeedScaleSmooth(min_speed_scale_);
+          should_publish_speed = true;
           pending_query_.reset();
         }
         else {
-          // best candidate의 target scale 찾기
+          publishRiskOrderedCollisionCandidates(batch, target_scales);
           size_t best_idx = 0;
           double best_target_scale = std::numeric_limits<double>::infinity();
 
@@ -963,41 +1032,30 @@ private:
             }
           }
 
-          
-
-          const double next_scale = updateSpeedScaleSmooth(best_target_scale);
-
-
-          publishSpeedScale(next_scale);
           auto iso_opt = getIsoLimitForHumanIndex(best_cand->human_index);
           if (!iso_opt.has_value()) {
-            RCLCPP_ERROR(this->get_logger(), "ISO limit missing while building demo snapshot");
-            const double fail_scale = updateSpeedScaleSmooth(min_speed_scale_);
-            publishSpeedScale(fail_scale);
+            speed_to_publish = updateSpeedScaleSmooth(min_speed_scale_);
+            should_publish_speed = true;
             pending_query_.reset();
+            publishSpeedScale(speed_to_publish);
             return;
           }
+
           DemoStateSnapshot snap;
           snap.stamp = this->now();
           snap.t_demo_sec = (snap.stamp - demo_start_time_).seconds();
 
           snap.selected_human_index = best_cand->human_index;
           snap.selected_robot_index = best_cand->robot_index;
-
           snap.selected_body_name = human_index_to_part_name_[best_cand->human_index];
           snap.selected_link_name = robot_index_to_link_name_[best_cand->robot_index];
-
           snap.distance = best_cand->distance;
           snap.direction_u = best_cand->u;
-
           snap.relative_speed_along_u = rel_speeds[best_idx];
           snap.human_meff = best_cand->human_meff;
           snap.robot_meff = best_cand->robot_meff;
           snap.reduced_mass = computeReducedMass(snap.human_meff, snap.robot_meff);
-
           snap.target_speed_scale = best_target_scale;
-          snap.applied_speed_scale = next_scale;
-
           snap.threshold_force = iso_opt->F_max;
           snap.estimated_collision_force = computeEstimatedCollisionForce(
             snap.relative_speed_along_u,
@@ -1005,8 +1063,16 @@ private:
             iso_opt->k
           );
 
-          
+          const double guarded_target_scale = applyForceLimitGuard(
+            best_target_scale,
+            snap.estimated_collision_force,
+            snap.threshold_force
+          );
 
+          speed_to_publish = updateSpeedScaleSmooth(guarded_target_scale);
+          should_publish_speed = true;
+
+          snap.applied_speed_scale = speed_to_publish;
           snap.link_speed_magnitudes = computeRobotLinkSpeedMagnitudes();
 
           latest_demo_state_ = snap;
@@ -1014,88 +1080,46 @@ private:
 
           publishDemoState(snap);
           appendDemoLog(snap);
-
-          publishCollisionState(*best_cand, rel_speeds[best_idx], next_scale);
-
-          const std::string part_name = human_index_to_part_name_[best_cand->human_index];
-          RCLCPP_INFO(
-            this->get_logger(),
-            "[collision-top3] batch=%lu | selected=%s | h=%u r=%u | dist=%.3f | "
-            "vrel=%.3f | meff_h=%.2f meff_r=%.2f | target=%.2f current=%.2f",
-            batch.batch_id,
-            part_name.c_str(),
-            best_cand->human_index, best_cand->robot_index,
-            best_cand->distance,
-            rel_speeds[best_idx],
-            best_cand->human_meff,
-            best_cand->robot_meff,
-            best_target_scale,
-            next_scale
-          );
+          publishCollisionState(*best_cand, rel_speeds[best_idx], speed_to_publish);
 
           pending_query_.reset();
         }
       }
       else if (pendingExpired(batch)) {
-        int ready_h = 0;
-        int ready_r = 0;
-        for (const auto &cand : batch.candidates) {
-          ready_h += cand.human_result_ready ? 1 : 0;
-          ready_r += cand.robot_result_ready ? 1 : 0;
-        }
-
-        RCLCPP_WARN(
-          this->get_logger(),
-          "Batch query timeout: batch=%lu (human_ready=%d/%zu, robot_ready=%d/%zu)",
-          batch.batch_id,
-          ready_h, batch.candidates.size(),
-          ready_r, batch.candidates.size()
-        );
-
-        const double next_scale = updateSpeedScaleSmooth(min_speed_scale_);
-        publishSpeedScale(next_scale);
+        speed_to_publish = updateSpeedScaleSmooth(min_speed_scale_);
+        should_publish_speed = true;
         pending_query_.reset();
       }
       else {
-        return;  // 아직 batch 응답 대기 중
+        return;
       }
     }
 
-    // =====================================================
     // 2) top3 후보 생성
-    // =====================================================
     std::vector<CollisionCandidate> top_candidates;
     if (!computeTopKCollisionCandidates(top_candidates, 3)) {
+      if (should_publish_speed) {
+        publishSpeedScale(speed_to_publish);
+      }
       return;
     }
 
-    // nearest candidate 기준으로 threshold 판단
     const double distance = top_candidates.front().distance;
 
     const double robot_radius_m = 1.3;
     const double distance_margin = 1.15;
-    const double assessment_distance_threshold = robot_radius_m * distance_margin;  // 1.495 m
+    const double assessment_distance_threshold = robot_radius_m * distance_margin;
 
     if (distance > assessment_distance_threshold) {
-      const double target_scale = 1.0;
-      const double next_scale = updateSpeedScaleSmooth(target_scale);
-      publishSpeedScale(next_scale);
-      publishEmptyCollisionCandidates();
+      speed_to_publish = updateSpeedScaleSmooth(1.0);
+      should_publish_speed = true;
 
-      RCLCPP_INFO_THROTTLE(
-        this->get_logger(), *this->get_clock(), 1000,
-        "[far skip] nearest_dist=%.3f m > threshold=%.3f m | speed keep %.2f",
-        distance, assessment_distance_threshold, next_scale
-      );
+      publishSpeedScale(speed_to_publish);
       return;
     }
 
-    // threshold 안에 들어왔을 때만 top3 publish
-    publishCollisionCandidates(top_candidates);
+    // publishCollisionCandidates(top_candidates);
 
-    // =====================================================
-    // 3) top3 전체에 대해 query batch 발행
-    // =====================================================
     PendingBatchQuery batch;
     batch.batch_id = ++batch_counter_;
     batch.batch_sent_time = this->now();
@@ -1121,8 +1145,13 @@ private:
     }
 
     pending_query_ = std::move(batch);
+
+    if (should_publish_speed) {
+      publishSpeedScale(speed_to_publish);
+    }
   }
- 
+
+
 private:
   // Subscribers
   rclcpp::Subscription<hrc_interfaces::msg::HumanDynamicsState>::SharedPtr sub_human_state_;
