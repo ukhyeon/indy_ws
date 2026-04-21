@@ -356,6 +356,28 @@ private:
     -u_robot_to_human.x(), -u_robot_to_human.y(), -u_robot_to_human.z());
   }
 
+  // double computeRelativeSpeedAlongU(
+  //   uint32_t human_index,
+  //   uint32_t robot_index,
+  //   const Eigen::Vector3d &u_robot_to_human) const
+  // {
+  //   if (human_index >= human_state_.velocities.size() ||
+  //       robot_index >= robot_state_.velocities.size()) {
+  //     return 0.0;
+  //   }
+
+  //   // const Eigen::Vector3d v_h = human_state_.velocities[human_index];
+  //   const Eigen::Vector3d v_r = robot_state_.velocities[robot_index];
+
+  //   // 사람은 항상 로봇 방향으로 0.3 m/s로 접근한다고 가정
+  //   const Eigen::Vector3d v_h = -0.3 * u_robot_to_human.normalized();
+
+  //   // positive -> robot approaching human along u
+  //   // return (v_r - v_h).dot(u_robot_to_human);
+
+  //   return v_r.dot(u_robot_to_human); // 임시 디버그, 사람의 속도 0
+  // }
+
   double computeRelativeSpeedAlongU(
     uint32_t human_index,
     uint32_t robot_index,
@@ -366,13 +388,13 @@ private:
       return 0.0;
     }
 
-    const Eigen::Vector3d v_h = human_state_.velocities[human_index];
+    const Eigen::Vector3d u = u_robot_to_human.normalized();
     const Eigen::Vector3d v_r = robot_state_.velocities[robot_index];
 
-    // positive -> robot approaching human along u
-    // return (v_r - v_h).dot(u_robot_to_human);
+    // 사람은 항상 로봇 방향으로 0.3 m/s로 접근한다고 가정
+    const Eigen::Vector3d v_h = -0.3 * u;
 
-    return v_r.dot(u_robot_to_human); // 임시 디버그, 사람의 속도 0
+    return (v_r - v_h).dot(u);
   }
 
   std::optional<IsoLimit> getIsoLimitForHumanIndex(uint32_t human_index) const
@@ -425,6 +447,7 @@ private:
     return relative_speed_along_u * std::sqrt(std::max(reduced_mass * k, 1e-9));
   }
 
+  // 허용 속도
   // 1차 저역 통과 필터, 현재 값과 목표 값 차이를 보고 
   double updateSpeedScaleSmooth(double target_speed_scale)
   {
@@ -772,6 +795,17 @@ private:
 
   }
 
+  void publishEmptyCollisionCandidates()
+  {
+    hrc_interfaces::msg::CollisionCandidates msg;
+    msg.header.stamp = this->now();
+    msg.header.frame_id = "world";
+    pub_collision_candidates_->publish(msg);
+  }
+
+
+
+
   void humanStateCallback(const hrc_interfaces::msg::HumanDynamicsState::SharedPtr msg)
   {
     std::vector<Eigen::Vector3d> pos, vel;
@@ -897,7 +931,7 @@ private:
           batch, target_scales, rel_speeds);
 
         if (best_cand == nullptr) {
-          // ISO 누락 등 비정상 상황 -> 에러 + fail-safe
+          // ISO 누락 등 비정상 상황 -> 에러 + fail-safe 최대 감속
           for (const auto &cand : batch.candidates) {
             auto iso_opt = getIsoLimitForHumanIndex(cand.human_index);
             if (!iso_opt.has_value()) {
@@ -929,7 +963,11 @@ private:
             }
           }
 
+          
+
           const double next_scale = updateSpeedScaleSmooth(best_target_scale);
+
+
           publishSpeedScale(next_scale);
           auto iso_opt = getIsoLimitForHumanIndex(best_cand->human_index);
           if (!iso_opt.has_value()) {
@@ -966,6 +1004,8 @@ private:
             snap.reduced_mass,
             iso_opt->k
           );
+
+          
 
           snap.link_speed_magnitudes = computeRobotLinkSpeedMagnitudes();
 
@@ -1040,6 +1080,7 @@ private:
       const double target_scale = 1.0;
       const double next_scale = updateSpeedScaleSmooth(target_scale);
       publishSpeedScale(next_scale);
+      publishEmptyCollisionCandidates();
 
       RCLCPP_INFO_THROTTLE(
         this->get_logger(), *this->get_clock(), 1000,
