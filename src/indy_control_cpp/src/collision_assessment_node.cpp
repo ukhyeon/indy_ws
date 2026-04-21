@@ -49,6 +49,7 @@ public:
 
     min_speed_scale_ = this->declare_parameter<double>("min_speed_scale", 0.05);
     max_speed_scale_ = this->declare_parameter<double>("max_speed_scale", 1.0);
+    guard_margin_ = this->declare_parameter<double>("guard_margin", 0.5);
 
     if (!loadIsoJson(iso_json_path_)) {
       throw std::runtime_error("Failed to load ISO JSON: " + iso_json_path_);
@@ -210,6 +211,24 @@ private:
     uint32_t robot_index;
     double distance;
     Eigen::Vector3d u_robot_to_human;
+  };
+
+  struct ActiveCandidateState
+  {
+    bool valid{false};
+
+    uint64_t query_id{0};
+    uint32_t human_index{0};
+    uint32_t robot_index{0};
+
+    std::string body_name;
+    std::string link_name;
+
+    double target_scale{1.0};
+    double force_ratio{0.0};
+    double distance{0.0};
+
+    rclcpp::Time selected_time{0, 0, RCL_ROS_TIME};
   };
 
 private:
@@ -413,7 +432,8 @@ private:
     }
 
     // 로봇이 접근할 때만 사람 접근속도 0.3 m/s를 보수적으로 더함
-    return vr_along_u + 0.3;
+    return vr_along_u ;
+    // return vr_along_u +0.3;
   }
 
   std::optional<IsoLimit> getIsoLimitForHumanIndex(uint32_t human_index) const
@@ -445,11 +465,14 @@ private:
     const double mu = computeReducedMass(human_meff, robot_meff);
     const double v_allow = computeVmax(iso_limit.F_max, mu, iso_limit.k);
 
-    // 현재 접근 속도가 허용속도보다 작으면 scale을 높이는 방향
-    // 크면 낮추는 방향
-    const double ratio = v_allow / std::max(relative_speed_along_u, 1e-6);
+    // -----------------------------
+    // 내부 안전 마진 적용
+    // 실제 제어는 v_allow보다 더 작은 v_guard 기준으로 감속 시작
+    // -----------------------------
+    const double v_guard = guard_margin_ * v_allow;
 
-    // 1.0보다 크면 여유 있다는 뜻
+    const double ratio = v_guard / std::max(relative_speed_along_u, 1e-6);
+
     return clamp(ratio, min_speed_scale_, max_speed_scale_);
   }
 
@@ -741,7 +764,7 @@ private:
   bool isValidRobotCollisionIndex(uint32_t robot_index) const
   {
     // link0, link1 제외
-    return !(robot_index == 0 || robot_index == 1);
+    return !(robot_index == 0 || robot_index == 1 || robot_index ==2 );
   }
 
   bool isValidHumanCollisionIndex(uint32_t human_index) const
@@ -925,6 +948,131 @@ private:
     pub_collision_candidates_->publish(msg);
   }
 
+  bool isHighPriorityBody(const std::string &body_name) const
+  {
+    return (body_name == "head" || body_name == "neck");
+  }
+
+  bool isArmFamilyBody(const std::string &body_name) const
+  {
+    return (
+      body_name == "left_shoulder"  ||
+      body_name == "right_shoulder" ||
+      body_name == "left_upper_arm" ||
+      body_name == "right_upper_arm" ||
+      body_name == "left_lower_arm" ||
+      body_name == "right_lower_arm" ||
+      body_name == "left_hand"      ||
+      body_name == "right_hand"
+    );
+  }
+
+  double getSwitchMargin(
+    const std::string &current_body,
+    const std::string &new_body) const
+  {
+    const bool current_arm = isArmFamilyBody(current_body);
+    const bool new_arm = isArmFamilyBody(new_body);
+
+    // 팔 계열 내부 switching은 더 보수적으로
+    if (current_arm && new_arm) {
+      return switch_margin_arm_family_;
+    }
+
+    return switch_margin_default_;
+  }
+
+  bool shouldSwitchCandidate(
+    const ActiveCandidateState &current_state,
+    uint64_t new_query_id,
+    uint32_t new_human_index,
+    uint32_t new_robot_index,
+    const std::string &new_body_name,
+    const std::string &new_link_name,
+    double new_target_scale,
+    double new_force_ratio,
+    double new_distance,
+    const rclcpp::Time &now_time) const
+  {
+    // 현재 활성 후보가 없으면 무조건 채택
+    if (!current_state.valid) {
+      return true;
+    }
+
+    // 동일 후보면 그대로 유지
+    if (current_state.human_index == new_human_index &&
+        current_state.robot_index == new_robot_index) {
+      return true;
+    }
+
+    const double hold_sec =
+      (now_time - current_state.selected_time).seconds();
+
+    // -----------------------------
+    // 1) Immediate override
+    // -----------------------------
+
+    // 새 후보가 head/neck 이고, 현재보다 조금이라도 더 위험하면 즉시 전환
+    if (isHighPriorityBody(new_body_name) &&
+        new_target_scale < current_state.target_scale) {
+      return true;
+    }
+
+    // threshold 초과면 즉시 전환
+    if (new_force_ratio > immediate_force_ratio_threshold_) {
+      return true;
+    }
+
+    // 매우 위험한 scale이면 즉시 전환
+    if (new_target_scale < immediate_target_scale_threshold_) {
+      return true;
+    }
+
+    // -----------------------------
+    // 2) Hold time
+    // -----------------------------
+    // 최근에 막 바꿨으면 기본적으로 유지
+    if (hold_sec < candidate_hold_time_sec_) {
+      return false;
+    }
+
+    // -----------------------------
+    // 3) Hysteresis by target scale
+    // -----------------------------
+    const double margin = getSwitchMargin(current_state.body_name, new_body_name);
+
+    // 새 후보가 충분히 더 위험할 때만 전환
+    if (new_target_scale < (current_state.target_scale - margin)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  void updateActiveCandidateState(
+    ActiveCandidateState &state,
+    uint64_t query_id,
+    uint32_t human_index,
+    uint32_t robot_index,
+    const std::string &body_name,
+    const std::string &link_name,
+    double target_scale,
+    double force_ratio,
+    double distance,
+    const rclcpp::Time &now_time)
+  {
+    state.valid = true;
+    state.query_id = query_id;
+    state.human_index = human_index;
+    state.robot_index = robot_index;
+    state.body_name = body_name;
+    state.link_name = link_name;
+    state.target_scale = target_scale;
+    state.force_ratio = force_ratio;
+    state.distance = distance;
+    state.selected_time = now_time;
+  }
+
 
 
 
@@ -1060,18 +1208,103 @@ private:
         }
         else {
           publishRiskOrderedCollisionCandidates(batch, target_scales);
-          size_t best_idx = 0;
-          double best_target_scale = std::numeric_limits<double>::infinity();
+          // -----------------------------
+          // 1) raw best 후보 정보 찾기
+          // -----------------------------
+          size_t raw_best_idx = 0;
+          double raw_best_target_scale = std::numeric_limits<double>::infinity();
 
           for (size_t i = 0; i < batch.candidates.size(); ++i) {
             if (batch.candidates[i].query_id == best_cand->query_id) {
-              best_idx = i;
-              best_target_scale = target_scales[i];
+              raw_best_idx = i;
+              raw_best_target_scale = target_scales[i];
               break;
             }
           }
 
-          auto iso_opt = getIsoLimitForHumanIndex(best_cand->human_index);
+          const auto now_time = this->now();
+
+          const std::string new_body_name =
+            human_index_to_part_name_[best_cand->human_index];
+          const std::string new_link_name =
+            robot_index_to_link_name_[best_cand->robot_index];
+
+          auto iso_opt_raw = getIsoLimitForHumanIndex(best_cand->human_index);
+          if (!iso_opt_raw.has_value()) {
+            speed_to_publish = updateSpeedScaleSmooth(min_speed_scale_);
+            should_publish_speed = true;
+            pending_query_.reset();
+            publishSpeedScale(speed_to_publish);
+            return;
+          }
+
+          const double new_reduced_mass =
+            computeReducedMass(best_cand->human_meff, best_cand->robot_meff);
+
+          const double new_estimated_force =
+            computeEstimatedCollisionForce(
+              rel_speeds[raw_best_idx],
+              new_reduced_mass,
+              iso_opt_raw->k
+            );
+
+          const double new_force_ratio =
+            iso_opt_raw->F_max > 1e-6
+              ? new_estimated_force / iso_opt_raw->F_max
+              : 0.0;
+
+          // -----------------------------
+          // 2) switch gate
+          // -----------------------------
+          const bool switch_to_new = shouldSwitchCandidate(
+            active_candidate_,
+            best_cand->query_id,
+            best_cand->human_index,
+            best_cand->robot_index,
+            new_body_name,
+            new_link_name,
+            raw_best_target_scale,
+            new_force_ratio,
+            best_cand->distance,
+            now_time
+          );
+
+          // -----------------------------
+          // 3) 최종 사용할 candidate 결정
+          // -----------------------------
+          size_t best_idx = raw_best_idx;
+          double best_target_scale = raw_best_target_scale;
+          const PendingCandidateQuery *chosen_cand = best_cand;
+
+          if (!switch_to_new && active_candidate_.valid) {
+            bool found_active_pair = false;
+
+            for (size_t i = 0; i < batch.candidates.size(); ++i) {
+              if (batch.candidates[i].human_index == active_candidate_.human_index &&
+                  batch.candidates[i].robot_index == active_candidate_.robot_index) {
+                best_idx = i;
+                best_target_scale = target_scales[i];
+                chosen_cand = &batch.candidates[i];
+                found_active_pair = true;
+                break;
+              }
+            }
+
+            // 현재 batch에 이전 active pair가 없으면 raw best로 fallback
+            if (!found_active_pair) {
+              best_idx = raw_best_idx;
+              best_target_scale = raw_best_target_scale;
+              chosen_cand = best_cand;
+            }
+          }
+
+
+          const std::string chosen_body_name =
+            human_index_to_part_name_[chosen_cand->human_index];
+          const std::string chosen_link_name =
+            robot_index_to_link_name_[chosen_cand->robot_index];
+
+          auto iso_opt = getIsoLimitForHumanIndex(chosen_cand->human_index);
           if (!iso_opt.has_value()) {
             speed_to_publish = updateSpeedScaleSmooth(min_speed_scale_);
             should_publish_speed = true;
@@ -1080,45 +1313,77 @@ private:
             return;
           }
 
+          const double chosen_reduced_mass =
+            computeReducedMass(chosen_cand->human_meff, chosen_cand->robot_meff);
+
+          const double chosen_estimated_force =
+            computeEstimatedCollisionForce(
+              rel_speeds[best_idx],
+              chosen_reduced_mass,
+              iso_opt->k
+            );
+
+          const double chosen_force_ratio =
+            iso_opt->F_max > 1e-6
+              ? chosen_estimated_force / iso_opt->F_max
+              : 0.0;
+
+          
+          updateActiveCandidateState(
+            active_candidate_,
+            chosen_cand->query_id,
+            chosen_cand->human_index,
+            chosen_cand->robot_index,
+            chosen_body_name,
+            chosen_link_name,
+            best_target_scale,
+            chosen_force_ratio,
+            chosen_cand->distance,
+            now_time
+          );
+          
+
+          // -----------------------------
+          // 4) Demo snapshot
+          // -----------------------------
           DemoStateSnapshot snap;
           snap.stamp = this->now();
           snap.t_demo_sec = (snap.stamp - demo_start_time_).seconds();
 
-          snap.selected_human_index = best_cand->human_index;
-          snap.selected_robot_index = best_cand->robot_index;
-          snap.selected_body_name = human_index_to_part_name_[best_cand->human_index];
-          snap.selected_link_name = robot_index_to_link_name_[best_cand->robot_index];
-          snap.distance = best_cand->distance;
-          //
-
-          snap.direction_u = best_cand->u;
+          snap.selected_human_index = chosen_cand->human_index;
+          snap.selected_robot_index = chosen_cand->robot_index;
+          snap.selected_body_name = human_index_to_part_name_[chosen_cand->human_index];
+          snap.selected_link_name = robot_index_to_link_name_[chosen_cand->robot_index];
+          snap.distance = chosen_cand->distance;
+          snap.direction_u = chosen_cand->u;
           snap.relative_speed_along_u = rel_speeds[best_idx];
 
-          const Eigen::Vector3d u_norm = best_cand->u.normalized();
-          const Eigen::Vector3d v_r = robot_state_.velocities[best_cand->robot_index];
+          
+
+          const Eigen::Vector3d u_norm = chosen_cand->u.normalized();
+          const Eigen::Vector3d v_r = robot_state_.velocities[chosen_cand->robot_index];
           const double vr_along_u = v_r.dot(u_norm);
 
           snap.robot_speed_along_u_raw = vr_along_u;
           snap.approach_bias_added = std::max(0.0, snap.relative_speed_along_u - vr_along_u);
 
-          snap.human_meff = best_cand->human_meff;               // directional meff
-          snap.human_meff_iso = iso_opt->m_h_iso;                // fixed ISO mass
-          snap.robot_meff = best_cand->robot_meff;
+          snap.human_meff = chosen_cand->human_meff;
+          snap.human_meff_iso = iso_opt->m_h_iso;
+          snap.robot_meff = chosen_cand->robot_meff;
 
           snap.reduced_mass = computeReducedMass(snap.human_meff, snap.robot_meff);
           snap.reduced_mass_iso = computeReducedMass(snap.human_meff_iso, snap.robot_meff);
 
           snap.iso_k = iso_opt->k;
-          snap.v_allow_dir = computeVmax(
-            iso_opt->F_max,
-            snap.reduced_mass,
-            iso_opt->k
-          );
-          snap.v_allow_iso = computeVmax(
-            iso_opt->F_max,
-            snap.reduced_mass_iso,
-            iso_opt->k
-          );
+
+          const double v_allow_dir_raw =
+            computeVmax(iso_opt->F_max, snap.reduced_mass, iso_opt->k);
+          const double v_allow_iso_raw =
+            computeVmax(iso_opt->F_max, snap.reduced_mass_iso, iso_opt->k);
+
+          // 실제 제어에 쓰는 내부 guard 기준 속도
+          snap.v_allow_dir = guard_margin_ * v_allow_dir_raw;
+          snap.v_allow_iso = guard_margin_ * v_allow_iso_raw;
 
           snap.target_speed_scale = best_target_scale;
           snap.threshold_force = iso_opt->F_max;
@@ -1144,8 +1409,6 @@ private:
             snap.threshold_force > 1e-6
               ? snap.estimated_collision_force_iso / snap.threshold_force
               : 0.0;
-          //
-
 
           const double guarded_target_scale = applyForceLimitGuard(
             best_target_scale,
@@ -1164,9 +1427,10 @@ private:
 
           publishDemoState(snap);
           appendDemoLog(snap);
-          publishCollisionState(*best_cand, rel_speeds[best_idx], speed_to_publish);
+          publishCollisionState(*chosen_cand, rel_speeds[best_idx], speed_to_publish);
 
           pending_query_.reset();
+          
         }
       }
       else if (pendingExpired(batch)) {
@@ -1182,6 +1446,7 @@ private:
     // 2) top3 후보 생성
     std::vector<CollisionCandidate> top_candidates;
     if (!computeTopKCollisionCandidates(top_candidates, 3)) {
+      active_candidate_.valid = false;
       if (should_publish_speed) {
         publishSpeedScale(speed_to_publish);
       }
@@ -1195,6 +1460,7 @@ private:
     const double assessment_distance_threshold = robot_radius_m * distance_margin;
 
     if (distance > assessment_distance_threshold) {
+      active_candidate_.valid = false;
       speed_to_publish = updateSpeedScaleSmooth(1.0);
       should_publish_speed = true;
 
@@ -1263,6 +1529,16 @@ private:
   uint64_t query_counter_{0};
   double current_speed_scale_{1.0};
 
+  ActiveCandidateState active_candidate_;
+
+  double switch_margin_default_{0.08}; // 
+  double switch_margin_arm_family_{0.2};
+  double candidate_hold_time_sec_{0.30};
+
+  double immediate_force_ratio_threshold_{1.0};
+  double immediate_target_scale_threshold_{0.4};
+  
+
   // 데모 영상 시간 맞춤
   DemoStateSnapshot latest_demo_state_;
   bool has_latest_demo_state_{false};
@@ -1278,6 +1554,7 @@ private:
   double alpha_down_{0.35};
   double min_speed_scale_{0.05};
   double max_speed_scale_{1.0};
+  double guard_margin_{0.5};
 
   std::string iso_json_path_;
   std::unordered_map<std::string, IsoLimit> iso_limits_;
