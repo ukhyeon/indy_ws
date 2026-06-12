@@ -23,6 +23,7 @@
 #include <hrc_interfaces/msg/robot_dynamics_state.hpp>
 #include "hrc_interfaces/msg/directional_meff_query.hpp"
 #include "hrc_interfaces/msg/directional_meff_result.hpp"
+#include "indy_control_cpp/perf_logger.hpp"
 
 using namespace std::chrono_literals;
 
@@ -76,6 +77,38 @@ public:
     pub_robot_result_ =
       this->create_publisher<hrc_interfaces::msg::DirectionalMeffResult>(
         "/indy/directional_meff_result", qos);
+
+    // ==========
+    // real time  
+    // ==========
+        perf_update_logger_ = std::make_unique<PerfCsvLogger>(
+      "/home/robotics/hrc_ws/analysis/realtime_perf/robot_dynamics_update_perf.csv",
+      std::vector<std::string>{
+        "t_ros_sec",
+        "read_robot_state_ms",
+        "compute_meff_x_ms",
+        "compute_link_state_ms",
+        "publish_ms",
+        "total_update_ms",
+        "nominal_deadline_ms",
+        "deadline_miss"
+      },
+      100
+    );
+
+    perf_query_logger_ = std::make_unique<PerfCsvLogger>(
+      "/home/robotics/hrc_ws/analysis/realtime_perf/robot_meff_query_perf.csv",
+      std::vector<std::string>{
+        "t_ros_sec",
+        "query_id",
+        "target_index",
+        "query_compute_ms",
+        "valid",
+        "nominal_deadline_ms",
+        "deadline_miss"
+      },
+      100
+    );
 
 
     // ================================
@@ -151,6 +184,10 @@ private:
   bool has_latest_state_{false};
   
   Eigen::Vector3d robot_base_offset_world_{0.0, 0.0, 0.6};
+
+  // realtime
+  std::unique_ptr<PerfCsvLogger> perf_update_logger_;
+  std::unique_ptr<PerfCsvLogger> perf_query_logger_;
 
 
   void publishRobotDynamicsState(
@@ -368,9 +405,15 @@ private:
 
   void timerCallback()
   {
+    const auto t_start = PerfCsvLogger::now();
+
     try {
+      const auto t_read0 = PerfCsvLogger::now();
+
       Eigen::VectorXd q_deg    = readQDegFromRobot();
       Eigen::VectorXd qdot_deg = readQdotDegFromRobot();
+
+      const auto t_read1 = PerfCsvLogger::now();
 
       Eigen::VectorXd q_rad    = degToRad(q_deg);
       Eigen::VectorXd qdot_rad = degToRad(qdot_deg);
@@ -380,9 +423,12 @@ private:
       latest_state_stamp_ = this->now();
       has_latest_state_ = true;
 
+      const auto t_meff0 = PerfCsvLogger::now();
 
       std::vector<double> meff_x;
       computeMeffWithGear(q_rad, meff_x);
+
+      const auto t_meff1 = PerfCsvLogger::now();
 
       std::vector<Eigen::Vector3d> link_com_positions;
       std::vector<Eigen::Vector3d> link_com_velocities;
@@ -423,7 +469,29 @@ private:
         link_com_velocities.push_back(v_com);
       }
 
+      const auto t_link1 = PerfCsvLogger::now();
+
+      const auto t_pub0 = PerfCsvLogger::now();
+
       publishRobotDynamicsState(link_com_positions, link_com_velocities);
+
+      const auto t_pub1 = PerfCsvLogger::now();
+
+      const double total_ms = PerfCsvLogger::msBetween(t_start, t_pub1);
+      const double deadline_ms = 10.0;
+
+      if (perf_update_logger_) {
+        perf_update_logger_->writeRow({
+          PerfCsvLogger::toStr(this->now().seconds()),
+          PerfCsvLogger::toStr(PerfCsvLogger::msBetween(t_read0, t_read1)),
+          PerfCsvLogger::toStr(PerfCsvLogger::msBetween(t_meff0, t_meff1)),
+          PerfCsvLogger::toStr(PerfCsvLogger::msBetween(t_meff1, t_link1)),
+          PerfCsvLogger::toStr(PerfCsvLogger::msBetween(t_pub0, t_pub1)),
+          PerfCsvLogger::toStr(total_ms),
+          PerfCsvLogger::toStr(deadline_ms),
+          std::to_string(static_cast<int>(total_ms > deadline_ms))
+        });
+      }
 
       // 계산은 10ms마다, 출력은 10번에 1번
       static int print_count = 0;
@@ -447,14 +515,14 @@ private:
         // }
         // RCLCPP_INFO(this->get_logger(), "%s", qdot_oss.str().c_str());
 
-        if (link_com_positions.size() > 5) {
-          const auto &p6 = link_com_positions[5];
-          RCLCPP_INFO(
-            this->get_logger(),
-            "[link6 world CoM] x=%.3f, y=%.3f, z=%.3f",
-            p6.x(), p6.y(), p6.z()
-          );
-        }
+        // if (link_com_positions.size() > 5) {
+        //   const auto &p6 = link_com_positions[5];
+        //   RCLCPP_INFO(
+        //     this->get_logger(),
+        //     "[link6 world CoM] x=%.3f, y=%.3f, z=%.3f",
+        //     p6.x(), p6.y(), p6.z()
+        //   );
+        // }
       
         // 유효질량
         // std::ostringstream meff_oss;
@@ -538,6 +606,9 @@ private:
   void robotQueryCallback(
     const hrc_interfaces::msg::DirectionalMeffQuery::SharedPtr msg)
   {
+    const auto t_query0 = PerfCsvLogger::now();
+    bool query_valid = false;
+
     hrc_interfaces::msg::DirectionalMeffResult result;
     result.header.stamp = this->now();
     result.header.frame_id = "world";
@@ -585,15 +656,49 @@ private:
       result.directional_meff = static_cast<float>(meff);
       pub_robot_result_->publish(result);
 
-      RCLCPP_INFO(this->get_logger(),
-        "[robot meff result] qid=%lu target=%d u=(%.3f, %.3f, %.3f) meff=%.3f",
-        msg->query_id, target_index, u.x(), u.y(), u.z(), meff);
+      query_valid = true;
+
+      const double query_ms = PerfCsvLogger::msSince(t_query0);
+      const double deadline_ms = 150.0;
+
+      if (perf_query_logger_) {
+        perf_query_logger_->writeRow({
+          PerfCsvLogger::toStr(this->now().seconds()),
+          std::to_string(msg->query_id),
+          std::to_string(msg->target_index),
+          PerfCsvLogger::toStr(query_ms),
+          std::to_string(static_cast<int>(query_valid)),
+          PerfCsvLogger::toStr(deadline_ms),
+          std::to_string(static_cast<int>(query_ms > deadline_ms))
+        });
+      }
+
+      // RCLCPP_INFO(this->get_logger(),
+      //   "[robot meff result] qid=%lu target=%d u=(%.3f, %.3f, %.3f) meff=%.3f",
+      //   msg->query_id, target_index, u.x(), u.y(), u.z(), meff);
 
     } catch (const std::exception &e) {
       RCLCPP_ERROR(this->get_logger(),
         "Failed robot directional meff: qid=%lu target=%d err=%s",
         msg->query_id, target_index, e.what());
       pub_robot_result_->publish(result);
+
+      query_valid = true;
+
+      const double query_ms = PerfCsvLogger::msSince(t_query0);
+      const double deadline_ms = 150.0;
+
+      if (perf_query_logger_) {
+        perf_query_logger_->writeRow({
+          PerfCsvLogger::toStr(this->now().seconds()),
+          std::to_string(msg->query_id),
+          std::to_string(msg->target_index),
+          PerfCsvLogger::toStr(query_ms),
+          std::to_string(static_cast<int>(query_valid)),
+          PerfCsvLogger::toStr(deadline_ms),
+          std::to_string(static_cast<int>(query_ms > deadline_ms))
+        });
+      }
     }
   }
 

@@ -24,6 +24,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "indy_control_cpp/perf_logger.hpp"
 
 using namespace std::chrono_literals;
 using json = nlohmann::json;
@@ -49,7 +50,7 @@ public:
 
     min_speed_scale_ = this->declare_parameter<double>("min_speed_scale", 0.05);
     max_speed_scale_ = this->declare_parameter<double>("max_speed_scale", 1.0);
-    guard_margin_ = this->declare_parameter<double>("guard_margin", 0.5);
+    guard_margin_ = this->declare_parameter<double>("guard_margin", 0.4); // 속도 마진 주기
 
     if (!loadIsoJson(iso_json_path_)) {
       throw std::runtime_error("Failed to load ISO JSON: " + iso_json_path_);
@@ -104,6 +105,28 @@ public:
     pub_demo_state_ = this->create_publisher<hrc_interfaces::msg::DemoState>(
       "/hrc/demo_state", 10);
 
+        perf_collision_logger_ = std::make_unique<PerfCsvLogger>(
+      "/home/robotics/hrc_ws/analysis/realtime_perf/collision_assessment_perf.csv",
+      std::vector<std::string>{
+        "t_ros_sec",
+        "human_state_age_ms",
+        "robot_state_age_ms",
+        "topk_candidate_ms",
+        "query_publish_ms",
+        "human_meff_latency_ms",
+        "robot_meff_latency_ms",
+        "batch_query_latency_ms",
+        "final_eval_ms",
+        "speed_publish_ms",
+        "total_timer_ms",
+        "nominal_deadline_ms",
+        "deadline_miss",
+        "query_timeout",
+        "num_candidates"
+      },
+      100
+    );
+
     timer_ = this->create_wall_timer(
       std::chrono::milliseconds(timer_period_ms_),
       std::bind(&CollisionAssessmentNode::timerCallback, this));
@@ -119,6 +142,17 @@ public:
   }
 
 private:
+
+  std::unique_ptr<PerfCsvLogger> perf_collision_logger_;
+
+  double ageMsFromStamp(const rclcpp::Time & stamp) const
+  {
+    if (stamp.nanoseconds() <= 0) {
+      return -1.0;
+    }
+    return (this->now() - stamp).nanoseconds() / 1e6;
+  }
+
   struct DemoStateSnapshot
   {
     rclcpp::Time stamp;
@@ -380,13 +414,15 @@ private:
     pub_robot_query_->publish(robot_q);
 
     // 충돌 방향 logger
-    RCLCPP_INFO_THROTTLE(
-    this->get_logger(), *this->get_clock(), 500,
-    "[query] qid=%lu | h=%u r=%u | u_h=[%.3f %.3f %.3f] | u_r=[%.3f %.3f %.3f]",
-    query_id,
-    human_index, robot_index,
-    u_robot_to_human.x(), u_robot_to_human.y(), u_robot_to_human.z(),
-    -u_robot_to_human.x(), -u_robot_to_human.y(), -u_robot_to_human.z());
+    // RCLCPP_INFO_THROTTLE(
+    // this->get_logger(), *this->get_clock(), 500,
+    // "[query] qid=%lu | h=%u r=%u | u_h=[%.3f %.3f %.3f] | u_r=[%.3f %.3f %.3f]",
+    // query_id,
+    // human_index, robot_index,
+    // u_robot_to_human.x(), u_robot_to_human.y(), u_robot_to_human.z(),
+    // -u_robot_to_human.x(), -u_robot_to_human.y(), -u_robot_to_human.z());
+
+
   }
 
   // double computeRelativeSpeedAlongU(
@@ -432,8 +468,8 @@ private:
     }
 
     // 로봇이 접근할 때만 사람 접근속도 0.3 m/s를 보수적으로 더함
-    return vr_along_u ;
-    // return vr_along_u +0.3;
+    // return vr_along_u ;
+    return vr_along_u;
   }
 
   std::optional<IsoLimit> getIsoLimitForHumanIndex(uint32_t human_index) const
@@ -593,9 +629,24 @@ private:
 
   void publishSpeedScale(double scale)
   {
+    const auto t0 = PerfCsvLogger::now();
+
     std_msgs::msg::Float32 msg;
     msg.data = static_cast<float>(clamp(scale, min_speed_scale_, max_speed_scale_));
     pub_speed_scale_->publish(msg);
+
+
+  }
+
+  double publishSpeedScaleMeasured(double scale)
+  {
+    const auto t0 = PerfCsvLogger::now();
+
+    std_msgs::msg::Float32 msg;
+    msg.data = static_cast<float>(clamp(scale, min_speed_scale_, max_speed_scale_));
+    pub_speed_scale_->publish(msg);
+
+    return PerfCsvLogger::msSince(t0);
   }
 
   void writeDemoLogHeaderIfNeeded()
@@ -1184,9 +1235,27 @@ private:
 
   void timerCallback()
   {
+    const auto t_timer0 = PerfCsvLogger::now();
+
+    double human_state_age_ms = -1.0;
+    double robot_state_age_ms = -1.0;
+    double topk_candidate_ms = 0.0;
+    double query_publish_ms = 0.0;
+    double human_meff_latency_ms = -1.0;
+    double robot_meff_latency_ms = -1.0;
+    double batch_query_latency_ms = -1.0;
+    double final_eval_ms = 0.0;
+    double speed_publish_ms = 0.0;
+    bool query_timeout = false;
+    int num_candidates = 0;
+
+
     if (!human_state_.valid || !robot_state_.valid) {
       return;
     }
+    human_state_age_ms = ageMsFromStamp(human_state_.stamp);
+    robot_state_age_ms = ageMsFromStamp(robot_state_.stamp);
+
 
     bool should_publish_speed = false;
     double speed_to_publish = current_speed_scale_;
@@ -1196,6 +1265,32 @@ private:
       auto &batch = pending_query_.value();
 
       if (batchAllResultsReady(batch)) {
+
+        const auto t_final0 = PerfCsvLogger::now();
+
+        batch_query_latency_ms =
+          (this->now() - batch.batch_sent_time).nanoseconds() / 1e6;
+
+        human_meff_latency_ms = -1.0;
+        robot_meff_latency_ms = -1.0;
+
+        for (const auto & cand : batch.candidates) {
+          if (cand.human_result_ready) {
+            const double lat =
+              (cand.human_result_time - cand.sent_time).nanoseconds() / 1e6;
+            human_meff_latency_ms =
+              std::max(human_meff_latency_ms, lat);
+          }
+
+          if (cand.robot_result_ready) {
+            const double lat =
+              (cand.robot_result_time - cand.sent_time).nanoseconds() / 1e6;
+            robot_meff_latency_ms =
+              std::max(robot_meff_latency_ms, lat);
+          }
+        }
+
+
         std::vector<double> target_scales;
         std::vector<double> rel_speeds;
         const auto *best_cand = selectMostConservativeCandidate(
@@ -1234,7 +1329,7 @@ private:
             speed_to_publish = updateSpeedScaleSmooth(min_speed_scale_);
             should_publish_speed = true;
             pending_query_.reset();
-            publishSpeedScale(speed_to_publish);
+            speed_publish_ms = publishSpeedScaleMeasured(speed_to_publish);
             return;
           }
 
@@ -1309,7 +1404,8 @@ private:
             speed_to_publish = updateSpeedScaleSmooth(min_speed_scale_);
             should_publish_speed = true;
             pending_query_.reset();
-            publishSpeedScale(speed_to_publish);
+            // publishSpeedScale(speed_to_publish);
+            speed_publish_ms = publishSpeedScaleMeasured(speed_to_publish);
             return;
           }
 
@@ -1432,8 +1528,14 @@ private:
           pending_query_.reset();
           
         }
+        
       }
       else if (pendingExpired(batch)) {
+        query_timeout = true;
+        batch_query_latency_ms =
+          (this->now() - batch.batch_sent_time).nanoseconds() / 1e6;
+
+
         speed_to_publish = updateSpeedScaleSmooth(min_speed_scale_);
         should_publish_speed = true;
         pending_query_.reset();
@@ -1445,11 +1547,36 @@ private:
 
     // 2) top3 후보 생성
     std::vector<CollisionCandidate> top_candidates;
-    if (!computeTopKCollisionCandidates(top_candidates, 3)) {
+
+    const auto t_topk0 = PerfCsvLogger::now();
+    const bool has_candidates = computeTopKCollisionCandidates(top_candidates, 3);
+    const auto t_topk1 = PerfCsvLogger::now();
+
+    topk_candidate_ms = PerfCsvLogger::msBetween(t_topk0, t_topk1);
+    num_candidates = static_cast<int>(top_candidates.size());
+
+    if (!has_candidates) {
       active_candidate_.valid = false;
+
       if (should_publish_speed) {
-        publishSpeedScale(speed_to_publish);
+        speed_publish_ms = publishSpeedScaleMeasured(speed_to_publish);
       }
+
+      writeCollisionPerfRow(
+        human_state_age_ms,
+        robot_state_age_ms,
+        topk_candidate_ms,
+        query_publish_ms,
+        human_meff_latency_ms,
+        robot_meff_latency_ms,
+        batch_query_latency_ms,
+        final_eval_ms,
+        speed_publish_ms,
+        PerfCsvLogger::msSince(t_timer0),
+        query_timeout,
+        num_candidates
+      );
+
       return;
     }
 
@@ -1475,6 +1602,8 @@ private:
     batch.batch_sent_time = this->now();
     batch.candidates.reserve(top_candidates.size());
 
+    const auto t_query_pub0 = PerfCsvLogger::now();
+
     for (const auto &c : top_candidates) {
       PendingCandidateQuery cand;
       cand.query_id = ++query_counter_;
@@ -1494,11 +1623,31 @@ private:
       batch.candidates.push_back(cand);
     }
 
+    const auto t_query_pub1 = PerfCsvLogger::now();
+    query_publish_ms = PerfCsvLogger::msBetween(t_query_pub0, t_query_pub1);
+
     pending_query_ = std::move(batch);
 
     if (should_publish_speed) {
-      publishSpeedScale(speed_to_publish);
+      speed_publish_ms = publishSpeedScaleMeasured(speed_to_publish);
     }
+
+    writeCollisionPerfRow(
+      human_state_age_ms,
+      robot_state_age_ms,
+      topk_candidate_ms,
+      query_publish_ms,
+      human_meff_latency_ms,
+      robot_meff_latency_ms,
+      batch_query_latency_ms,
+      final_eval_ms,
+      speed_publish_ms,
+      PerfCsvLogger::msSince(t_timer0),
+      query_timeout,
+      num_candidates
+    );
+
+
   }
 
 
@@ -1554,7 +1703,7 @@ private:
   double alpha_down_{0.35};
   double min_speed_scale_{0.05};
   double max_speed_scale_{1.0};
-  double guard_margin_{0.5};
+  double guard_margin_{0.4};
 
   std::string iso_json_path_;
   std::unordered_map<std::string, IsoLimit> iso_limits_;
@@ -1562,6 +1711,46 @@ private:
   std::ofstream demo_log_ofs_;
   std::string demo_log_path_;
   bool demo_log_header_written_{false};
+
+
+  void writeCollisionPerfRow(
+    double human_state_age_ms,
+    double robot_state_age_ms,
+    double topk_candidate_ms,
+    double query_publish_ms,
+    double human_meff_latency_ms,
+    double robot_meff_latency_ms,
+    double batch_query_latency_ms,
+    double final_eval_ms,
+    double speed_publish_ms,
+    double total_timer_ms,
+    bool query_timeout,
+    int num_candidates)
+  {
+    const double deadline_ms = static_cast<double>(timer_period_ms_);
+
+    if (!perf_collision_logger_) {
+      return;
+    }
+
+    perf_collision_logger_->writeRow({
+      PerfCsvLogger::toStr(this->now().seconds()),
+      PerfCsvLogger::toStr(human_state_age_ms),
+      PerfCsvLogger::toStr(robot_state_age_ms),
+      PerfCsvLogger::toStr(topk_candidate_ms),
+      PerfCsvLogger::toStr(query_publish_ms),
+      PerfCsvLogger::toStr(human_meff_latency_ms),
+      PerfCsvLogger::toStr(robot_meff_latency_ms),
+      PerfCsvLogger::toStr(batch_query_latency_ms),
+      PerfCsvLogger::toStr(final_eval_ms),
+      PerfCsvLogger::toStr(speed_publish_ms),
+      PerfCsvLogger::toStr(total_timer_ms),
+      PerfCsvLogger::toStr(deadline_ms),
+      std::to_string(static_cast<int>(total_timer_ms > deadline_ms)),
+      std::to_string(static_cast<int>(query_timeout)),
+      std::to_string(num_candidates)
+    });
+  }
 
 };
 

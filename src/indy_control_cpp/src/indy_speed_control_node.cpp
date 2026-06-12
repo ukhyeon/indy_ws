@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "indy_control_cpp/indydcp3.h"
+#include "indy_control_cpp/perf_logger.hpp"
 
 using std::placeholders::_1;
 
@@ -20,10 +21,24 @@ public:
       std::bind(&IndySpeedNode::speedCallback, this, _1)
     );
 
+    perf_speed_logger_ = std::make_unique<PerfCsvLogger>(
+    "/home/robotics/hrc_ws/analysis/realtime_perf/robot_speed_command_perf.csv",
+    std::vector<std::string>{
+      "t_ros_sec",
+      "speed_scale",
+      "speed_ratio_percent",
+      "set_speed_ratio_ms",
+      "success"
+    },
+    30
+  );
+
     RCLCPP_INFO(this->get_logger(), "Indy Speed Node started");
   }
 
 private:
+  std::unique_ptr<PerfCsvLogger> perf_speed_logger_;
+
   void speedCallback(const std_msgs::msg::Float32::SharedPtr msg)
   {
     float scale = msg->data;
@@ -32,7 +47,19 @@ private:
     unsigned int speed_ratio =
       static_cast<unsigned int>(scale * 100.0f);
 
+    const auto t0 = PerfCsvLogger::now();
     bool is_success = indy_.set_speed_ratio(speed_ratio);
+    const double command_ms = PerfCsvLogger::msSince(t0);
+
+    if (perf_speed_logger_) {
+      perf_speed_logger_->writeRow({
+        PerfCsvLogger::toStr(this->now().seconds()),
+        PerfCsvLogger::toStr(scale),
+        std::to_string(speed_ratio),
+        PerfCsvLogger::toStr(command_ms),
+        std::to_string(static_cast<int>(is_success))
+      });
+    }
 
     if (is_success) {
       RCLCPP_INFO(

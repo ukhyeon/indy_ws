@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.8)
 project(indy_control_cpp)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -58,6 +61,17 @@ target_link_libraries(indydcp3
     gRPC::grpc++_reflection
 )
 
+# =========================
+# Header-only performance logger
+# =========================
+add_library(perf_logger INTERFACE)
+
+target_include_directories(perf_logger
+  INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
 #Check;  connection check node
 add_executable(indy_connection_check_node src/check/indy_connection_check_node.cpp)
 
@@ -67,6 +81,7 @@ ament_target_dependencies(indy_connection_check_node
 )
 target_link_libraries(indy_connection_check_node
   indydcp3
+  perf_logger
 )
 install(TARGETS
   indy_connection_check_node
@@ -103,6 +118,7 @@ ament_target_dependencies(indy_speed_check_node
 target_link_libraries(indy_speed_check_node
   indydcp3
   pinocchio::pinocchio
+  perf_logger
 )
 install(TARGETS
   indy_speed_check_node
@@ -118,6 +134,7 @@ ament_target_dependencies(indy_speed_control_node
 )
 target_link_libraries(indy_speed_control_node
   indydcp3
+  perf_logger
 )
 install(TARGETS
   indy_speed_control_node
@@ -132,7 +149,9 @@ add_executable(robot_dynamics_node
 
 target_link_libraries(robot_dynamics_node
   indydcp3
-  pinocchio::pinocchio)
+  pinocchio::pinocchio
+  perf_logger
+  )
 install(TARGETS
   robot_dynamics_node
   DESTINATION lib/${PROJECT_NAME}
@@ -161,6 +180,7 @@ ament_target_dependencies(collision_assessment_node
 target_link_libraries(collision_assessment_node
   nlohmann_json::nlohmann_json
   Eigen3::Eigen
+  perf_logger
 )
 
 # collision check 
