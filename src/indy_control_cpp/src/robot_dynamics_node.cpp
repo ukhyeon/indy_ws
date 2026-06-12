@@ -82,7 +82,7 @@ public:
     // real time  
     // ==========
         perf_update_logger_ = std::make_unique<PerfCsvLogger>(
-      "/home/robotics/hrc_ws/analysis/realtime_perf/robot_dynamics_update_perf.csv",
+      "/home/robotics/hrc_ws/analysis/realtime_perf/paper_robot_dynamics_perf.csv",
       std::vector<std::string>{
         "t_ros_sec",
         "read_robot_state_ms",
@@ -97,7 +97,7 @@ public:
     );
 
     perf_query_logger_ = std::make_unique<PerfCsvLogger>(
-      "/home/robotics/hrc_ws/analysis/realtime_perf/robot_meff_query_perf.csv",
+      "/home/robotics/hrc_ws/analysis/realtime_perf/paper_robot_meff_query_perf.csv",
       std::vector<std::string>{
         "t_ros_sec",
         "query_id",
@@ -654,11 +654,12 @@ private:
 
       result.valid = true;
       result.directional_meff = static_cast<float>(meff);
+      const double query_ms = PerfCsvLogger::msSince(t_query0);
+      result.compute_time_ms = static_cast<float>(query_ms);
       pub_robot_result_->publish(result);
 
       query_valid = true;
 
-      const double query_ms = PerfCsvLogger::msSince(t_query0);
       const double deadline_ms = 150.0;
 
       if (perf_query_logger_) {
@@ -681,11 +682,12 @@ private:
       RCLCPP_ERROR(this->get_logger(),
         "Failed robot directional meff: qid=%lu target=%d err=%s",
         msg->query_id, target_index, e.what());
+      const double query_ms = PerfCsvLogger::msSince(t_query0);
+      result.compute_time_ms = static_cast<float>(query_ms);
       pub_robot_result_->publish(result);
 
       query_valid = true;
 
-      const double query_ms = PerfCsvLogger::msSince(t_query0);
       const double deadline_ms = 150.0;
 
       if (perf_query_logger_) {

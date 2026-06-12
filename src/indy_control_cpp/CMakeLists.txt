@@ -14,6 +14,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(hrc_interfaces REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -130,7 +131,7 @@ add_executable(indy_speed_control_node src/indy_speed_control_node.cpp)
 
 ament_target_dependencies(indy_speed_control_node
   rclcpp
-  std_msgs
+  hrc_interfaces
 )
 target_link_libraries(indy_speed_control_node
   indydcp3
@@ -142,8 +143,6 @@ install(TARGETS
 )
 
 # robot_dynamics
-find_package(hrc_interfaces REQUIRED)
-
 add_executable(robot_dynamics_node
   src/robot_dynamics_node.cpp)
 
@@ -165,7 +164,6 @@ ament_target_dependencies(robot_dynamics_node
 
 #collision_assessment
 find_package(geometry_msgs REQUIRED)
-find_package(hrc_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_executable(collision_assessment_node

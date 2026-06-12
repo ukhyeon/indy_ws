@@ -1,5 +1,4 @@
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/float32.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 
 #include <hrc_interfaces/msg/human_dynamics_state.hpp>
@@ -9,6 +8,7 @@
 #include <hrc_interfaces/msg/collision_state.hpp>
 #include "hrc_interfaces/msg/collision_candidates.hpp"
 #include <hrc_interfaces/msg/demo_state.hpp>
+#include <hrc_interfaces/msg/speed_scale_command.hpp>
 
 #include <Eigen/Dense>
 #include <nlohmann/json.hpp>
@@ -90,7 +90,7 @@ public:
     pub_robot_query_ = this->create_publisher<hrc_interfaces::msg::DirectionalMeffQuery>(
       "/indy/directional_meff_query", qos);
 
-    pub_speed_scale_ = this->create_publisher<std_msgs::msg::Float32>(
+    pub_speed_scale_ = this->create_publisher<hrc_interfaces::msg::SpeedScaleCommand>(
       "/indy/speed_scale", 10);
 
     pub_collision_state_ = this->create_publisher<hrc_interfaces::msg::CollisionState>(
@@ -106,9 +106,10 @@ public:
       "/hrc/demo_state", 10);
 
         perf_collision_logger_ = std::make_unique<PerfCsvLogger>(
-      "/home/robotics/hrc_ws/analysis/realtime_perf/collision_assessment_perf.csv",
+      "/home/robotics/hrc_ws/analysis/realtime_perf/paper_collision_assessment_perf.csv",
       std::vector<std::string>{
         "t_ros_sec",
+        "assessment_id",
         "human_state_age_ms",
         "robot_state_age_ms",
         "topk_candidate_ms",
@@ -117,6 +118,7 @@ public:
         "robot_meff_latency_ms",
         "batch_query_latency_ms",
         "final_eval_ms",
+        "candidate_assessment_latency_ms",
         "speed_publish_ms",
         "total_timer_ms",
         "nominal_deadline_ms",
@@ -525,28 +527,64 @@ private:
     return relative_speed_along_u * std::sqrt(std::max(reduced_mass * k, 1e-9));
   }
 
-  double applyForceLimitGuard(
-    double target_speed_scale,
-    double estimated_collision_force,
-    double threshold_force) const
+  // 불연속
+  // double applyForceLimitGuard(
+  //   double target_speed_scale,
+  //   double estimated_collision_force,
+  //   double threshold_force) const
+  // {
+  //   const double eps = 1e-6;
+  //   const double ratio = estimated_collision_force / std::max(threshold_force, eps);
+
+  //   double guarded_scale = target_speed_scale;
+
+  //   if (ratio > 1.30) {
+  //     guarded_scale = std::min(guarded_scale, 0.05);
+  //   } else if (ratio > 1.15) {
+  //     guarded_scale = std::min(guarded_scale, 0.10);
+  //   } else if (ratio > 1.05) {
+  //     guarded_scale = std::min(guarded_scale, 0.20);
+  //   } else if (ratio > 1.00) {
+  //     guarded_scale = std::min(guarded_scale, 0.35);
+  //   }
+
+  //   return clamp(guarded_scale, min_speed_scale_, max_speed_scale_);
+  // }
+
+    double applyForceLimitGuard(
+      double target_speed_scale,
+      double estimated_collision_force,
+      double threshold_force) const
   {
-    const double eps = 1e-6;
-    const double ratio = estimated_collision_force / std::max(threshold_force, eps);
+      const double eps = 1e-6;
 
-    double guarded_scale = target_speed_scale;
+      // Estimated collision-force ratio relative to the threshold.
+      const double force_ratio =
+          std::max(0.0, estimated_collision_force) /
+          std::max(threshold_force, eps);
 
-    if (ratio > 1.30) {
-      guarded_scale = std::min(guarded_scale, 0.05);
-    } else if (ratio > 1.15) {
-      guarded_scale = std::min(guarded_scale, 0.10);
-    } else if (ratio > 1.05) {
-      guarded_scale = std::min(guarded_scale, 0.20);
-    } else if (ratio > 1.00) {
-      guarded_scale = std::min(guarded_scale, 0.35);
-    }
+      // Empirical attenuation rate for the continuous exponential cap.
+      // This is an implementation parameter, not an ISO-derived value.
+      const double kappa = 8.0;
 
-    return clamp(guarded_scale, min_speed_scale_, max_speed_scale_);
+      // Continuous force-ratio-based upper bound.
+      const double guard_cap =
+          (force_ratio <= 1.0)
+              ? 1.0
+              : std::exp(-kappa * (force_ratio - 1.0));
+
+      // Preserve the existing PFL-derived target scale and apply
+      // the continuous guard only as an independent upper bound.
+      const double guarded_scale =
+          std::min(target_speed_scale, guard_cap);
+
+      return clamp(
+          guarded_scale,
+          min_speed_scale_,
+          max_speed_scale_);
   }
+
+
 
   // 허용 속도
   // 1차 저역 통과 필터, 현재 값과 목표 값 차이를 보고 
@@ -627,25 +665,28 @@ private:
     pub_demo_state_->publish(msg);
   }
 
-  void publishSpeedScale(double scale)
+  void publishSpeedScale(
+    double scale,
+    uint64_t assessment_id = 0,
+    const rclcpp::Time & assessment_start = rclcpp::Time(0, 0, RCL_ROS_TIME))
   {
-    const auto t0 = PerfCsvLogger::now();
-
-    std_msgs::msg::Float32 msg;
-    msg.data = static_cast<float>(clamp(scale, min_speed_scale_, max_speed_scale_));
+    hrc_interfaces::msg::SpeedScaleCommand msg;
+    msg.header.stamp = this->now();
+    msg.header.frame_id = "world";
+    msg.assessment_id = assessment_id;
+    msg.assessment_start_stamp = assessment_start;
+    msg.speed_scale =
+      static_cast<float>(clamp(scale, min_speed_scale_, max_speed_scale_));
     pub_speed_scale_->publish(msg);
-
-
   }
 
-  double publishSpeedScaleMeasured(double scale)
+  double publishSpeedScaleMeasured(
+    double scale,
+    uint64_t assessment_id = 0,
+    const rclcpp::Time & assessment_start = rclcpp::Time(0, 0, RCL_ROS_TIME))
   {
     const auto t0 = PerfCsvLogger::now();
-
-    std_msgs::msg::Float32 msg;
-    msg.data = static_cast<float>(clamp(scale, min_speed_scale_, max_speed_scale_));
-    pub_speed_scale_->publish(msg);
-
+    publishSpeedScale(scale, assessment_id, assessment_start);
     return PerfCsvLogger::msSince(t0);
   }
 
@@ -1245,9 +1286,12 @@ private:
     double robot_meff_latency_ms = -1.0;
     double batch_query_latency_ms = -1.0;
     double final_eval_ms = 0.0;
+    double candidate_assessment_latency_ms = -1.0;
     double speed_publish_ms = 0.0;
     bool query_timeout = false;
     int num_candidates = 0;
+    uint64_t completed_assessment_id = 0;
+    rclcpp::Time completed_assessment_start{0, 0, RCL_ROS_TIME};
 
 
     if (!human_state_.valid || !robot_state_.valid) {
@@ -1267,6 +1311,8 @@ private:
       if (batchAllResultsReady(batch)) {
 
         const auto t_final0 = PerfCsvLogger::now();
+        completed_assessment_id = batch.batch_id;
+        completed_assessment_start = batch.batch_sent_time;
 
         batch_query_latency_ms =
           (this->now() - batch.batch_sent_time).nanoseconds() / 1e6;
@@ -1329,7 +1375,13 @@ private:
             speed_to_publish = updateSpeedScaleSmooth(min_speed_scale_);
             should_publish_speed = true;
             pending_query_.reset();
-            speed_publish_ms = publishSpeedScaleMeasured(speed_to_publish);
+            final_eval_ms = PerfCsvLogger::msSince(t_final0);
+            candidate_assessment_latency_ms =
+              (this->now() - completed_assessment_start).nanoseconds() / 1e6;
+            speed_publish_ms = publishSpeedScaleMeasured(
+              speed_to_publish,
+              completed_assessment_id,
+              completed_assessment_start);
             return;
           }
 
@@ -1405,7 +1457,13 @@ private:
             should_publish_speed = true;
             pending_query_.reset();
             // publishSpeedScale(speed_to_publish);
-            speed_publish_ms = publishSpeedScaleMeasured(speed_to_publish);
+            final_eval_ms = PerfCsvLogger::msSince(t_final0);
+            candidate_assessment_latency_ms =
+              (this->now() - completed_assessment_start).nanoseconds() / 1e6;
+            speed_publish_ms = publishSpeedScaleMeasured(
+              speed_to_publish,
+              completed_assessment_id,
+              completed_assessment_start);
             return;
           }
 
@@ -1528,6 +1586,10 @@ private:
           pending_query_.reset();
           
         }
+
+        final_eval_ms = PerfCsvLogger::msSince(t_final0);
+        candidate_assessment_latency_ms =
+          (this->now() - completed_assessment_start).nanoseconds() / 1e6;
         
       }
       else if (pendingExpired(batch)) {
@@ -1559,10 +1621,14 @@ private:
       active_candidate_.valid = false;
 
       if (should_publish_speed) {
-        speed_publish_ms = publishSpeedScaleMeasured(speed_to_publish);
+        speed_publish_ms = publishSpeedScaleMeasured(
+          speed_to_publish,
+          completed_assessment_id,
+          completed_assessment_start);
       }
 
       writeCollisionPerfRow(
+        completed_assessment_id,
         human_state_age_ms,
         robot_state_age_ms,
         topk_candidate_ms,
@@ -1571,6 +1637,7 @@ private:
         robot_meff_latency_ms,
         batch_query_latency_ms,
         final_eval_ms,
+        candidate_assessment_latency_ms,
         speed_publish_ms,
         PerfCsvLogger::msSince(t_timer0),
         query_timeout,
@@ -1591,7 +1658,27 @@ private:
       speed_to_publish = updateSpeedScaleSmooth(1.0);
       should_publish_speed = true;
 
-      publishSpeedScale(speed_to_publish);
+      speed_publish_ms = publishSpeedScaleMeasured(
+        speed_to_publish,
+        completed_assessment_id,
+        completed_assessment_start);
+
+      writeCollisionPerfRow(
+        completed_assessment_id,
+        human_state_age_ms,
+        robot_state_age_ms,
+        topk_candidate_ms,
+        query_publish_ms,
+        human_meff_latency_ms,
+        robot_meff_latency_ms,
+        batch_query_latency_ms,
+        final_eval_ms,
+        candidate_assessment_latency_ms,
+        speed_publish_ms,
+        PerfCsvLogger::msSince(t_timer0),
+        query_timeout,
+        num_candidates
+      );
       return;
     }
 
@@ -1629,10 +1716,14 @@ private:
     pending_query_ = std::move(batch);
 
     if (should_publish_speed) {
-      speed_publish_ms = publishSpeedScaleMeasured(speed_to_publish);
+      speed_publish_ms = publishSpeedScaleMeasured(
+        speed_to_publish,
+        completed_assessment_id,
+        completed_assessment_start);
     }
 
     writeCollisionPerfRow(
+      completed_assessment_id,
       human_state_age_ms,
       robot_state_age_ms,
       topk_candidate_ms,
@@ -1641,6 +1732,7 @@ private:
       robot_meff_latency_ms,
       batch_query_latency_ms,
       final_eval_ms,
+      candidate_assessment_latency_ms,
       speed_publish_ms,
       PerfCsvLogger::msSince(t_timer0),
       query_timeout,
@@ -1661,7 +1753,7 @@ private:
   // Publishers
   rclcpp::Publisher<hrc_interfaces::msg::DirectionalMeffQuery>::SharedPtr pub_human_query_;
   rclcpp::Publisher<hrc_interfaces::msg::DirectionalMeffQuery>::SharedPtr pub_robot_query_;
-  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pub_speed_scale_;
+  rclcpp::Publisher<hrc_interfaces::msg::SpeedScaleCommand>::SharedPtr pub_speed_scale_;
   rclcpp::Publisher<hrc_interfaces::msg::CollisionState>::SharedPtr pub_collision_state_;
   rclcpp::Publisher<hrc_interfaces::msg::CollisionCandidates>::SharedPtr pub_collision_candidates_;
   rclcpp::Publisher<hrc_interfaces::msg::DemoState>::SharedPtr pub_demo_state_;
@@ -1714,6 +1806,7 @@ private:
 
 
   void writeCollisionPerfRow(
+    uint64_t assessment_id,
     double human_state_age_ms,
     double robot_state_age_ms,
     double topk_candidate_ms,
@@ -1722,6 +1815,7 @@ private:
     double robot_meff_latency_ms,
     double batch_query_latency_ms,
     double final_eval_ms,
+    double candidate_assessment_latency_ms,
     double speed_publish_ms,
     double total_timer_ms,
     bool query_timeout,
@@ -1735,6 +1829,7 @@ private:
 
     perf_collision_logger_->writeRow({
       PerfCsvLogger::toStr(this->now().seconds()),
+      std::to_string(assessment_id),
       PerfCsvLogger::toStr(human_state_age_ms),
       PerfCsvLogger::toStr(robot_state_age_ms),
       PerfCsvLogger::toStr(topk_candidate_ms),
@@ -1743,6 +1838,7 @@ private:
       PerfCsvLogger::toStr(robot_meff_latency_ms),
       PerfCsvLogger::toStr(batch_query_latency_ms),
       PerfCsvLogger::toStr(final_eval_ms),
+      PerfCsvLogger::toStr(candidate_assessment_latency_ms),
       PerfCsvLogger::toStr(speed_publish_ms),
       PerfCsvLogger::toStr(total_timer_ms),
       PerfCsvLogger::toStr(deadline_ms),
