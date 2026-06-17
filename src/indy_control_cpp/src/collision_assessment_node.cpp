@@ -51,6 +51,14 @@ public:
     min_speed_scale_ = this->declare_parameter<double>("min_speed_scale", 0.05);
     max_speed_scale_ = this->declare_parameter<double>("max_speed_scale", 1.0);
     guard_margin_ = this->declare_parameter<double>("guard_margin", 0.4); // 속도 마진 주기
+    robot_radius_m_ = this->declare_parameter<double>("robot_radius_m", 1.3);
+    distance_margin_ = this->declare_parameter<double>("distance_margin", 1.15);
+    robot_base_center_world_.x() =
+      this->declare_parameter<double>("robot_base_center_x", 0.0);
+    robot_base_center_world_.y() =
+      this->declare_parameter<double>("robot_base_center_y", 0.0);
+    robot_base_center_world_.z() =
+      this->declare_parameter<double>("robot_base_center_z", 0.6);
 
     if (!loadIsoJson(iso_json_path_)) {
       throw std::runtime_error("Failed to load ISO JSON: " + iso_json_path_);
@@ -141,6 +149,13 @@ public:
 
     RCLCPP_INFO(this->get_logger(), "collision_assessment_node started");
     RCLCPP_INFO(this->get_logger(), "Loaded ISO JSON: %s", iso_json_path_.c_str());
+    RCLCPP_INFO(
+      this->get_logger(),
+      "PFL activation sphere: center=[%.3f, %.3f, %.3f] m, R_act=%.3f m",
+      robot_base_center_world_.x(),
+      robot_base_center_world_.y(),
+      robot_base_center_world_.z(),
+      activationRadius());
   }
 
 private:
@@ -184,7 +199,8 @@ private:
     double v_allow_dir{0.0};
     double v_allow_iso{0.0};
 
-    double target_speed_scale{1.0};
+    double target_speed_scale{1.0};         // raw PFL target before force guard
+    double command_target_speed_scale{1.0}; // actual smoothing input after force guard
     double applied_speed_scale{1.0};
 
     double estimated_collision_force_dir{0.0};
@@ -707,7 +723,7 @@ private:
       << "reduced_mass_dir,reduced_mass_iso,"
       << "iso_k,"
       << "v_allow_dir,v_allow_iso,"
-      << "speed_scale_target,speed_scale_applied,"
+      << "speed_scale_target,command_target_speed_scale,speed_scale_applied,"
       << "estimated_collision_force_dir,estimated_collision_force_iso,"
       << "threshold_force,"
       << "force_ratio_dir,force_ratio_iso,"
@@ -743,6 +759,7 @@ private:
       << snap.v_allow_dir << ","
       << snap.v_allow_iso << ","
       << snap.target_speed_scale << ","
+      << snap.command_target_speed_scale << ","
       << snap.applied_speed_scale << ","
       << snap.estimated_collision_force_dir << ","
       << snap.estimated_collision_force_iso << ","
@@ -863,6 +880,44 @@ private:
   {
     // left_foot(6), right_foot(7) 제외
     return !(human_index == 6 || human_index == 7);
+  }
+
+  double activationRadius() const
+  {
+    return robot_radius_m_ * distance_margin_;
+  }
+
+  bool hasHumanBodyPartInsideActivationSphere(
+    double * minimum_distance_from_base = nullptr) const
+  {
+    double minimum_distance = std::numeric_limits<double>::infinity();
+    bool has_valid_body_part = false;
+    const double activation_radius = activationRadius();
+
+    for (size_t hi = 0; hi < human_state_.positions.size(); ++hi) {
+      const uint32_t human_index = static_cast<uint32_t>(hi);
+      if (!isValidHumanCollisionIndex(human_index)) {
+        continue;
+      }
+
+      has_valid_body_part = true;
+      const double distance_from_base =
+        (human_state_.positions[hi] - robot_base_center_world_).norm();
+      minimum_distance = std::min(minimum_distance, distance_from_base);
+
+      if (distance_from_base <= activation_radius) {
+        if (minimum_distance_from_base != nullptr) {
+          *minimum_distance_from_base = minimum_distance;
+        }
+        return true;
+      }
+    }
+
+    if (minimum_distance_from_base != nullptr) {
+      *minimum_distance_from_base =
+        has_valid_body_part ? minimum_distance : -1.0;
+    }
+    return false;
   }
 
   bool computeTopKCollisionCandidates(
@@ -1300,6 +1355,44 @@ private:
     human_state_age_ms = ageMsFromStamp(human_state_.stamp);
     robot_state_age_ms = ageMsFromStamp(robot_state_.stamp);
 
+    double minimum_human_base_distance = -1.0;
+    const bool pfl_active = hasHumanBodyPartInsideActivationSphere(
+      &minimum_human_base_distance);
+
+    if (!pfl_active) {
+      pending_query_.reset();
+      active_candidate_.valid = false;
+
+      const double speed_to_publish = updateSpeedScaleSmooth(max_speed_scale_);
+      const double speed_publish_ms = publishSpeedScaleMeasured(speed_to_publish);
+
+      RCLCPP_DEBUG_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        2000,
+        "PFL skipped: all valid human body parts are outside activation sphere "
+        "(min base distance=%.3f m, R_act=%.3f m)",
+        minimum_human_base_distance,
+        activationRadius());
+
+      writeCollisionPerfRow(
+        0,
+        human_state_age_ms,
+        robot_state_age_ms,
+        0.0,
+        0.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        0.0,
+        -1.0,
+        speed_publish_ms,
+        PerfCsvLogger::msSince(t_timer0),
+        false,
+        0
+      );
+      return;
+    }
 
     bool should_publish_speed = false;
     double speed_to_publish = current_speed_scale_;
@@ -1570,6 +1663,7 @@ private:
             snap.threshold_force
           );
 
+          snap.command_target_speed_scale = guarded_target_scale;
           speed_to_publish = updateSpeedScaleSmooth(guarded_target_scale);
           should_publish_speed = true;
 
@@ -1644,41 +1738,6 @@ private:
         num_candidates
       );
 
-      return;
-    }
-
-    const double distance = top_candidates.front().distance;
-
-    const double robot_radius_m = 1.3;
-    const double distance_margin = 1.15;
-    const double assessment_distance_threshold = robot_radius_m * distance_margin;
-
-    if (distance > assessment_distance_threshold) {
-      active_candidate_.valid = false;
-      speed_to_publish = updateSpeedScaleSmooth(1.0);
-      should_publish_speed = true;
-
-      speed_publish_ms = publishSpeedScaleMeasured(
-        speed_to_publish,
-        completed_assessment_id,
-        completed_assessment_start);
-
-      writeCollisionPerfRow(
-        completed_assessment_id,
-        human_state_age_ms,
-        robot_state_age_ms,
-        topk_candidate_ms,
-        query_publish_ms,
-        human_meff_latency_ms,
-        robot_meff_latency_ms,
-        batch_query_latency_ms,
-        final_eval_ms,
-        candidate_assessment_latency_ms,
-        speed_publish_ms,
-        PerfCsvLogger::msSince(t_timer0),
-        query_timeout,
-        num_candidates
-      );
       return;
     }
 
@@ -1796,6 +1855,9 @@ private:
   double min_speed_scale_{0.05};
   double max_speed_scale_{1.0};
   double guard_margin_{0.4};
+  double robot_radius_m_{1.3};
+  double distance_margin_{1.15};
+  Eigen::Vector3d robot_base_center_world_{0.0, 0.0, 0.6};
 
   std::string iso_json_path_;
   std::unordered_map<std::string, IsoLimit> iso_limits_;
