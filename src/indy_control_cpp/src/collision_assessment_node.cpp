@@ -46,11 +46,15 @@ public:
       "/home/robotics/indy_ws/src/indy_control_cpp/ISO15066/iso_15066.json");
 
     alpha_up_ = this->declare_parameter<double>("alpha_up", 0.10);       // speed up slowly
-    alpha_down_ = this->declare_parameter<double>("alpha_down", 0.35);   // slow down faster
+    alpha_down_ = this->declare_parameter<double>("alpha_down", 0.28);   // slow down faster
 
     min_speed_scale_ = this->declare_parameter<double>("min_speed_scale", 0.05);
     max_speed_scale_ = this->declare_parameter<double>("max_speed_scale", 1.0);
     guard_margin_ = this->declare_parameter<double>("guard_margin", 0.4); // 속도 마진 주기
+    force_guard_onset_ratio_ =
+      this->declare_parameter<double>("force_guard_onset_ratio", 0.70);
+    force_guard_cap_at_threshold_ =
+      this->declare_parameter<double>("force_guard_cap_at_threshold", 0.30);
     robot_radius_m_ = this->declare_parameter<double>("robot_radius_m", 1.3);
     distance_margin_ = this->declare_parameter<double>("distance_margin", 1.15);
     robot_base_center_world_.x() =
@@ -567,30 +571,37 @@ private:
   //   return clamp(guarded_scale, min_speed_scale_, max_speed_scale_);
   // }
 
-    double applyForceLimitGuard(
+  double applyForceLimitGuard(
       double target_speed_scale,
       double estimated_collision_force,
       double threshold_force) const
   {
       const double eps = 1e-6;
 
-      // Estimated collision-force ratio relative to the threshold.
       const double force_ratio =
           std::max(0.0, estimated_collision_force) /
           std::max(threshold_force, eps);
 
-      // Empirical attenuation rate for the continuous exponential cap.
-      // This is an implementation parameter, not an ISO-derived value.
-      const double kappa = 8.0;
+      // Smooth force-ratio-based cap. These are implementation parameters,
+      // not ISO-derived values. Lower onset starts attenuation earlier, while
+      // lower cap_at_threshold commands stronger preemptive deceleration.
+      const double onset_ratio =
+          clamp(force_guard_onset_ratio_, 0.05, 0.99);
+      const double cap_at_threshold =
+          clamp(force_guard_cap_at_threshold_, min_speed_scale_, max_speed_scale_);
 
-      // Continuous force-ratio-based upper bound.
+      const double guard_ratio =
+          force_ratio / std::max(onset_ratio, eps);
+
+      const double kappa =
+          -std::log(cap_at_threshold) /
+          std::max(1.0 / onset_ratio - 1.0, eps);
+
       const double guard_cap =
-          (force_ratio <= 1.0)
+          (guard_ratio <= 1.0)
               ? 1.0
-              : std::exp(-kappa * (force_ratio - 1.0));
+              : std::exp(-kappa * (guard_ratio - 1.0));
 
-      // Preserve the existing PFL-derived target scale and apply
-      // the continuous guard only as an independent upper bound.
       const double guarded_scale =
           std::min(target_speed_scale, guard_cap);
 
@@ -1851,10 +1862,12 @@ private:
   int query_timeout_ms_{150};
 
   double alpha_up_{0.10};
-  double alpha_down_{0.35};
+  double alpha_down_{0.28};
   double min_speed_scale_{0.05};
   double max_speed_scale_{1.0};
   double guard_margin_{0.4};
+  double force_guard_onset_ratio_{0.70};
+  double force_guard_cap_at_threshold_{0.30};
   double robot_radius_m_{1.3};
   double distance_margin_{1.15};
   Eigen::Vector3d robot_base_center_world_{0.0, 0.0, 0.6};
