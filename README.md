@@ -151,3 +151,10 @@ environment. Review them before building or connecting to hardware.
 - [`hrc_ws`](https://github.com/ukhyeon/hrc_ws) — human sensing, pose estimation,
   human dynamics, visualization, and shared ROS 2 interfaces
 
+## License and third-party software
+
+Original code in this repository is licensed under the Apache License 2.0.
+The IndyDCP3 client and generated Protobuf/gRPC sources are derived from
+Neuromeka's MIT-licensed `neuromeka-package` and retain the corresponding
+copyright and license notice. See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for details.
