@@ -6,7 +6,8 @@ combines robot state and human dynamics information to estimate potential
 collision severity and generate a risk-aware speed-scale command.
 
 The human sensing, pose estimation, human dynamics, and shared ROS 2 message
-definitions are maintained in [`hrc_ws`](https://github.com/ukhyeon/hrc_ws).
+definitions are maintained in
+[`hrc_ws-public`](https://github.com/ukhyeon/hrc_ws-public).
 
 ## System overview
 
@@ -71,7 +72,8 @@ artifacts and are not part of the source distribution.
 
 - ROS 2 with `colcon`
 - A C++17 compiler
-- [`hrc_ws`](https://github.com/ukhyeon/hrc_ws), providing `hrc_interfaces`
+- [`hrc_ws-public`](https://github.com/ukhyeon/hrc_ws-public), providing
+  `hrc_interfaces`
 - Pinocchio
 - Eigen3
 - nlohmann/json
@@ -148,7 +150,8 @@ environment. Review them before building or connecting to hardware.
 
 ## Related repository
 
-- [`hrc_ws`](https://github.com/ukhyeon/hrc_ws) — human sensing, pose estimation,
+- [`hrc_ws-public`](https://github.com/ukhyeon/hrc_ws-public) — human sensing,
+  pose estimation,
   human dynamics, visualization, and shared ROS 2 interfaces
 
 ## License and third-party software
